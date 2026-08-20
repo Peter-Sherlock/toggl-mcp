@@ -15,6 +15,7 @@ from toggl_mcp.exceptions import (
     TogglAuthorizationError,
     TogglQuotaError,
     TogglRateLimitError,
+    TogglRequestValidationError,
 )
 
 ORGANIZATION_ID = 321
@@ -223,8 +224,10 @@ async def test_stop_timer_uses_scoped_endpoint_and_clock() -> None:
 @pytest.mark.parametrize(
     ("status", "error_type"),
     [
+        (400, TogglRequestValidationError),
         (401, TogglAuthorizationError),
         (403, TogglAuthorizationError),
+        (422, TogglRequestValidationError),
         (429, TogglRateLimitError),
     ],
 )
@@ -243,6 +246,7 @@ async def test_http_errors_are_classified(
         with pytest.raises(error_type) as captured:
             await client.get_current_timer()
 
+    assert captured.value.status_code == status
     assert captured.value.retry_after_seconds == 42
 
 
@@ -256,3 +260,21 @@ async def test_error_detail_redacts_api_key() -> None:
             await client.list_projects()
 
     assert captured.value.detail == "bad credential [REDACTED]"
+
+
+@pytest.mark.asyncio
+async def test_validation_error_422_preserves_status_code_and_redacts_api_key() -> None:
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            422,
+            text='{"error": "invalid field", "key": "toggl_sk_test-key"}',
+        )
+    )
+    async with TogglClient(config(), transport=transport) as client:
+        with pytest.raises(TogglRequestValidationError) as captured:
+            await client.get_current_timer()
+
+    assert captured.value.status_code == 422
+    assert captured.value.detail is not None
+    assert "toggl_sk_test-key" not in captured.value.detail
+    assert "[REDACTED]" in captured.value.detail

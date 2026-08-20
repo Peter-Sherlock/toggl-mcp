@@ -239,3 +239,27 @@ async def test_tool_error_redacts_api_key_and_raw_response() -> None:
     assert "authentication failed" in rendered
     assert "toggl_sk_protocol-test" not in rendered
     assert "private upstream detail" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tool_error_handles_422_validation_error() -> None:
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                422,
+                text="unprocessable entity toggl_sk_protocol-test invalid payload",
+            )
+        ),
+        enable_write_tools=False,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool("list_projects")
+
+    rendered = " ".join(getattr(item, "text", "") for item in result.content)
+    assert result.is_error is True
+    assert "Toggl rejected the request. Check the supplied values and project ID." in rendered
+    assert "toggl_sk_protocol-test" not in rendered
+    assert "unprocessable entity" not in rendered
+    assert "Traceback" not in rendered

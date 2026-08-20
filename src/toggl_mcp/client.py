@@ -246,7 +246,7 @@ class TogglClient:
         detail = self._safe_response_detail(response)
         retry_after = self._retry_after_seconds(response)
 
-        if status == 400:
+        if status in (400, 422):
             error_type: type[TogglAPIError] = TogglRequestValidationError
             message = "Toggl rejected the request parameters."
         elif status == 402:

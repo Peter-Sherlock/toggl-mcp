@@ -6,7 +6,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from toggl_mcp.models import Project, TimeEntry
+from toggl_mcp.models import Client, Project, Tag, Task, TimeEntry
 
 
 class ToolOutput(BaseModel):
@@ -81,6 +81,13 @@ class TimeEntriesOutput(ToolOutput):
     start_date: datetime
     end_date: datetime
     count: int = Field(description="Number of entries returned after internal pagination.")
+    possibly_truncated: bool = Field(
+        description=(
+            "True when the result may be incomplete: Toggl's reported total exceeded the "
+            "fetched entries, or pagination hit its safety page limit. Do not treat count "
+            "as a complete summary of the interval when this is true."
+        )
+    )
     entries: list[TimeEntrySummary]
 
 
@@ -101,3 +108,155 @@ class StopTimerOutput(ToolOutput):
     reason: str | None = Field(
         description="Machine-readable no-op reason; null after a successful stop."
     )
+
+
+class ClientSummary(ToolOutput):
+    """Toggl client (customer) fields an agent needs for project assignment."""
+
+    id: int = Field(description="Toggl client ID.")
+    name: str = Field(description="Human-readable client name.")
+    archived: bool = Field(description="Whether the client is archived.")
+
+    @classmethod
+    def from_client(cls, client: Client) -> ClientSummary:
+        return cls(id=client.id, name=client.name, archived=client.archived)
+
+
+class TagSummary(ToolOutput):
+    """Toggl tag fields an agent needs when tagging time entries."""
+
+    id: int = Field(description="Toggl tag ID.")
+    name: str = Field(description="Human-readable tag name.")
+
+    @classmethod
+    def from_tag(cls, tag: Tag) -> TagSummary:
+        if tag.id is None:
+            raise ValueError("Workspace list endpoints always return hydrated tag IDs")
+        return cls(id=tag.id, name=tag.name)
+
+
+class TaskSummary(ToolOutput):
+    """Task fields an agent needs when tracking against a project task."""
+
+    id: int = Field(description="Toggl task ID.")
+    name: str = Field(description="Human-readable task name.")
+    project_id: int = Field(description="Project the task belongs to.")
+    active: bool = Field(description="Whether the task is active.")
+
+    @classmethod
+    def from_task(cls, task: Task) -> TaskSummary:
+        return cls(id=task.id, name=task.name, project_id=task.project_id, active=task.active)
+
+
+class ListClientsOutput(ToolOutput):
+    """Result of listing clients in the configured workspace."""
+
+    count: int = Field(description="Number of clients returned.")
+    clients: list[ClientSummary]
+
+
+class ListTagsOutput(ToolOutput):
+    """Result of listing tags in the configured workspace."""
+
+    count: int = Field(description="Number of tags returned.")
+    tags: list[TagSummary]
+
+
+class ListTasksOutput(ToolOutput):
+    """Result of listing tasks of one project."""
+
+    count: int = Field(description="Number of tasks returned.")
+    tasks: list[TaskSummary]
+
+
+class CreateTimeEntryOutput(ToolOutput):
+    """Confirmation and backend representation of a created time entry."""
+
+    created: bool = Field(default=True)
+    time_entry: TimeEntrySummary
+
+
+class UpdateTimeEntryOutput(ToolOutput):
+    """Confirmation and backend representation of an updated time entry."""
+
+    updated: bool = Field(default=True)
+    time_entry: TimeEntrySummary
+
+
+class DeletedEntityOutput(ToolOutput):
+    """Confirmation that an entity was deleted."""
+
+    deleted: bool = Field(default=True)
+    entity_id: int = Field(description="ID of the deleted entity.")
+
+
+class CreateProjectOutput(ToolOutput):
+    """Confirmation and backend representation of a created project."""
+
+    created: bool = Field(default=True)
+    project: ProjectSummary
+
+
+class UpdateProjectOutput(ToolOutput):
+    """Confirmation and backend representation of an updated project."""
+
+    updated: bool = Field(default=True)
+    project: ProjectSummary
+
+
+class BulkEditOutcomeSummary(ToolOutput):
+    """Per-entry result of a bulk edit."""
+
+    entry_id: int = Field(description="Time-entry ID this outcome belongs to.")
+    updated: bool = Field(description="Whether the edit was applied to this entry.")
+    error: str | None = Field(
+        description="Stable failure reason for this entry; null when updated is true."
+    )
+
+
+class BulkEditTimeEntriesOutput(ToolOutput):
+    """Aggregated per-entry outcomes of one bulk edit."""
+
+    updated_count: int = Field(description="Number of entries successfully edited.")
+    failed_count: int = Field(description="Number of entries whose edit failed.")
+    outcomes: list[BulkEditOutcomeSummary]
+
+
+class SummaryGroupOutput(ToolOutput):
+    """One aggregation bucket of a time summary."""
+
+    label: str = Field(
+        description="Project name, UTC date (YYYY-MM-DD), or tag name for this bucket."
+    )
+    seconds: int = Field(description="Tracked seconds aggregated under this label.")
+    entry_count: int = Field(description="Number of finished entries under this label.")
+    project_id: int | None = Field(
+        description="Project ID when grouping by project; null for other groupings."
+    )
+
+
+class SummarizeTimeOutput(ToolOutput):
+    """Aggregated tracked time for an interval, safe for statistics and reporting."""
+
+    start_date: datetime
+    end_date: datetime
+    group_by: str = Field(description="Aggregation bucket used for groups.")
+    entry_count: int = Field(
+        description="All entries in the interval, including still-running ones."
+    )
+    tracked_seconds: int = Field(
+        description=(
+            "Sum of finished durations in seconds. Still-running entries are excluded "
+            "because their durations are not final."
+        )
+    )
+    running_count: int = Field(
+        description="Entries still running; excluded from tracked_seconds."
+    )
+    possibly_truncated: bool = Field(
+        description=(
+            "True when the interval may contain more entries than were returned. Treat "
+            "every total here as a lower bound and narrow the interval before reporting."
+        )
+    )
+    groups: list[SummaryGroupOutput]

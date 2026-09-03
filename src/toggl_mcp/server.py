@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 
 import httpx
 from mcp.server import MCPServer
@@ -34,13 +34,28 @@ from toggl_mcp.exceptions import (
     TogglServerError,
 )
 from toggl_mcp.tool_models import (
+    BulkEditOutcomeSummary,
+    BulkEditTimeEntriesOutput,
+    ClientSummary,
+    CreateProjectOutput,
+    CreateTimeEntryOutput,
     CurrentTimerOutput,
+    DeletedEntityOutput,
+    ListClientsOutput,
     ListProjectsOutput,
+    ListTagsOutput,
+    ListTasksOutput,
     ProjectSummary,
     StartTimerOutput,
     StopTimerOutput,
+    SummarizeTimeOutput,
+    SummaryGroupOutput,
+    TagSummary,
+    TaskSummary,
     TimeEntriesOutput,
     TimeEntrySummary,
+    UpdateProjectOutput,
+    UpdateTimeEntryOutput,
 )
 
 logger = logging.getLogger(__name__)
@@ -204,7 +219,116 @@ def create_server(
             start_date=start_date,
             end_date=end_date,
             count=len(entries),
+            possibly_truncated=result.possibly_truncated,
             entries=entries,
+        )
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
+            "Read one time entry by its exact Toggl ID, e.g. before updating or deleting it."
+        ),
+    )
+    async def get_time_entry(
+        entry_id: Annotated[int, Field(gt=0, description="Exact Toggl time-entry ID.")],
+        context: Context[ServerState, Any],
+    ) -> TimeEntrySummary:
+        timer = await _execute(
+            "get_time_entry",
+            lambda: _state(context).client.get_time_entry(entry_id),
+        )
+        return TimeEntrySummary.from_time_entry(timer)
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
+            "List clients (customers) of the configured Toggl workspace. Client IDs are "
+            "accepted by create_project."
+        ),
+    )
+    async def list_clients(context: Context[ServerState, Any]) -> ListClientsOutput:
+        clients = await _execute("list_clients", _state(context).client.list_clients)
+        summaries = [ClientSummary.from_client(client) for client in clients]
+        return ListClientsOutput(count=len(summaries), clients=summaries)
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description="List tags of the configured Toggl workspace.",
+    )
+    async def list_tags(context: Context[ServerState, Any]) -> ListTagsOutput:
+        tags = await _execute("list_tags", _state(context).client.list_tags)
+        summaries = [TagSummary.from_tag(tag) for tag in tags]
+        return ListTagsOutput(count=len(summaries), tags=summaries)
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
+            "List tasks of one project. Toggl only offers tasks on plans with the tasks "
+            "feature; on other plans this fails with a not-found error, which is expected."
+        ),
+    )
+    async def list_tasks(
+        project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
+        context: Context[ServerState, Any],
+    ) -> ListTasksOutput:
+        tasks = await _execute(
+            "list_tasks", lambda: _state(context).client.list_tasks(project_id)
+        )
+        summaries = [TaskSummary.from_task(task) for task in tasks]
+        return ListTasksOutput(count=len(summaries), tasks=summaries)
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
+            "Summarize tracked time in a timezone-aware interval, grouped by project, UTC "
+            "date, or tag. Computed from the raw entries; when possibly_truncated is true, "
+            "treat every total as a lower bound and narrow the interval before reporting."
+        ),
+    )
+    async def summarize_time(
+        start_date: Annotated[
+            datetime,
+            Field(description="Interval start as an ISO 8601 timestamp with timezone."),
+        ],
+        end_date: Annotated[
+            datetime,
+            Field(description="Interval end as an ISO 8601 timestamp with timezone."),
+        ],
+        group_by: Annotated[
+            Literal["project", "date", "tag"],
+            Field(description="Aggregation bucket for the returned groups."),
+        ] = "project",
+        *,
+        context: Context[ServerState, Any],
+    ) -> SummarizeTimeOutput:
+        summary = await _execute(
+            "summarize_time",
+            lambda: _state(context).client.summarize_time(
+                start_date, end_date, group_by=group_by
+            ),
+        )
+        return SummarizeTimeOutput(
+            start_date=start_date,
+            end_date=end_date,
+            group_by=group_by,
+            entry_count=summary.entry_count,
+            tracked_seconds=summary.tracked_seconds,
+            running_count=summary.running_count,
+            possibly_truncated=summary.possibly_truncated,
+            groups=[
+                SummaryGroupOutput(
+                    label=group.label,
+                    seconds=group.seconds,
+                    entry_count=group.entry_count,
+                    project_id=group.project_id,
+                )
+                for group in summary.groups
+            ],
         )
 
     writes_enabled = _write_tools_enabled() if enable_write_tools is None else enable_write_tools
@@ -221,13 +345,33 @@ def create_server(
             idempotent_hint=True,
             open_world_hint=True,
         )
+        create_annotations = ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=True,
+        )
+        update_annotations = ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=True,
+        )
+        delete_annotations = ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=True,
+            idempotent_hint=False,
+            open_world_hint=True,
+        )
 
         @server.tool(
             annotations=start_annotations,
             structured_output=True,
             description=(
                 "Start a real Toggl timer with a non-empty description and optional exact "
-                "project_id. Fails safely if another timer is already running."
+                "project_id. Checks for an already-running timer first and fails instead of "
+                "replacing it; that check is best-effort, so a timer started in another "
+                "client moments earlier can still be replaced."
             ),
         )
         async def start_timer(
@@ -269,6 +413,266 @@ def create_server(
                 timer=TimeEntrySummary.from_time_entry(timer),
                 reason=None,
             )
+
+        @server.tool(
+            annotations=create_annotations,
+            structured_output=True,
+            description=(
+                "Create a stopped time entry directly (backfill), with an explicit start "
+                "timestamp and positive duration. This changes real Toggl data."
+            ),
+        )
+        async def create_time_entry(
+            description: Annotated[
+                str,
+                Field(min_length=1, description="What was tracked."),
+            ],
+            start: Annotated[
+                datetime,
+                Field(description="Entry start as an ISO 8601 timestamp with timezone."),
+            ],
+            duration_seconds: Annotated[
+                int, Field(gt=0, description="Tracked duration in seconds.")
+            ],
+            project_id: Annotated[
+                int | None, Field(gt=0, description="Exact Toggl project ID, if any.")
+            ] = None,
+            tags: Annotated[
+                list[str] | None, Field(description="Tag names to attach to the entry.")
+            ] = None,
+            billable: Annotated[bool, Field(description="Mark the entry as billable.")] = False,
+            *,
+            context: Context[ServerState, Any],
+        ) -> CreateTimeEntryOutput:
+            timer = await _execute(
+                "create_time_entry",
+                lambda: _state(context).client.create_time_entry(
+                    description,
+                    start,
+                    duration_seconds,
+                    project_id=project_id,
+                    tags=tags,
+                    billable=billable,
+                ),
+            )
+            return CreateTimeEntryOutput(
+                time_entry=TimeEntrySummary.from_time_entry(timer)
+            )
+
+        @server.tool(
+            annotations=update_annotations,
+            structured_output=True,
+            description=(
+                "Update fields of one time entry by ID. Omitted fields stay unchanged; "
+                "clearing a project or task is not supported. This changes real Toggl data."
+            ),
+        )
+        async def update_time_entry(
+            entry_id: Annotated[int, Field(gt=0, description="Exact Toggl time-entry ID.")],
+            description: Annotated[str | None, Field(min_length=1)] = None,
+            project_id: Annotated[int | None, Field(gt=0)] = None,
+            tags: Annotated[list[str] | None, Field()] = None,
+            start: Annotated[
+                datetime | None,
+                Field(description="New entry start as an ISO 8601 timestamp with timezone."),
+            ] = None,
+            duration_seconds: Annotated[int | None, Field(gt=0)] = None,
+            *,
+            context: Context[ServerState, Any],
+        ) -> UpdateTimeEntryOutput:
+            timer = await _execute(
+                "update_time_entry",
+                lambda: _state(context).client.update_time_entry(
+                    entry_id,
+                    description=description,
+                    project_id=project_id,
+                    tags=tags,
+                    start=start,
+                    duration_seconds=duration_seconds,
+                ),
+            )
+            return UpdateTimeEntryOutput(time_entry=TimeEntrySummary.from_time_entry(timer))
+
+        @server.tool(
+            annotations=update_annotations,
+            structured_output=True,
+            description=(
+                "Apply the same tag and project changes to many time entries at once: add "
+                "tags by name, remove tags by name, and/or move all entries to one "
+                "project. Every entry is edited and reported individually; one failure "
+                "never blocks the rest. Tags must already exist (create_tag first). This "
+                "changes real Toggl data."
+            ),
+        )
+        async def bulk_edit_time_entries(
+            entry_ids: Annotated[
+                list[int],
+                Field(min_length=1, description="Time-entry IDs to edit, without duplicates."),
+            ],
+            add_tags: Annotated[
+                list[str] | None,
+                Field(description="Tag names to attach to every listed entry."),
+            ] = None,
+            remove_tags: Annotated[
+                list[str] | None,
+                Field(description="Tag names to detach from every listed entry."),
+            ] = None,
+            project_id: Annotated[
+                int | None,
+                Field(gt=0, description="Move every listed entry to this project."),
+            ] = None,
+            *,
+            context: Context[ServerState, Any],
+        ) -> BulkEditTimeEntriesOutput:
+            outcomes = await _execute(
+                "bulk_edit_time_entries",
+                lambda: _state(context).client.bulk_edit_time_entries(
+                    entry_ids,
+                    add_tags=add_tags,
+                    remove_tags=remove_tags,
+                    project_id=project_id,
+                ),
+            )
+            return BulkEditTimeEntriesOutput(
+                updated_count=sum(1 for outcome in outcomes if outcome.updated),
+                failed_count=sum(1 for outcome in outcomes if not outcome.updated),
+                outcomes=[
+                    BulkEditOutcomeSummary(
+                        entry_id=outcome.entry_id,
+                        updated=outcome.updated,
+                        error=outcome.error,
+                    )
+                    for outcome in outcomes
+                ],
+            )
+
+        @server.tool(
+            annotations=delete_annotations,
+            structured_output=True,
+            description=(
+                "Permanently delete one time entry by ID. This is destructive and cannot be "
+                "undone through Toggl."
+            ),
+        )
+        async def delete_time_entry(
+            entry_id: Annotated[int, Field(gt=0, description="Exact Toggl time-entry ID.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> DeletedEntityOutput:
+            await _execute(
+                "delete_time_entry",
+                lambda: _state(context).client.delete_time_entry(entry_id),
+            )
+            return DeletedEntityOutput(deleted=True, entity_id=entry_id)
+
+        @server.tool(
+            annotations=create_annotations,
+            structured_output=True,
+            description=(
+                "Create a project in the configured Toggl workspace. Use list_clients to "
+                "resolve a client_id. This changes real Toggl data."
+            ),
+        )
+        async def create_project(
+            name: Annotated[str, Field(min_length=1, description="New project name.")],
+            active: Annotated[bool, Field(description="Whether the project is active.")] = True,
+            client_id: Annotated[int | None, Field(gt=0)] = None,
+            color: Annotated[str | None, Field(description="Hex color for the project.")] = None,
+            is_private: Annotated[bool, Field(description="Restrict the project.")] = True,
+            *,
+            context: Context[ServerState, Any],
+        ) -> CreateProjectOutput:
+            project = await _execute(
+                "create_project",
+                lambda: _state(context).client.create_project(
+                    name,
+                    active=active,
+                    client_id=client_id,
+                    color=color,
+                    is_private=is_private,
+                ),
+            )
+            return CreateProjectOutput(project=ProjectSummary.from_project(project))
+
+        @server.tool(
+            annotations=update_annotations,
+            structured_output=True,
+            description=(
+                "Update a project by ID. Omitted fields stay unchanged. This changes real "
+                "Toggl data."
+            ),
+        )
+        async def update_project(
+            project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
+            name: Annotated[str | None, Field(min_length=1)] = None,
+            active: Annotated[bool | None, Field()] = None,
+            client_id: Annotated[int | None, Field(gt=0)] = None,
+            *,
+            context: Context[ServerState, Any],
+        ) -> UpdateProjectOutput:
+            project = await _execute(
+                "update_project",
+                lambda: _state(context).client.update_project(
+                    project_id, name=name, active=active, client_id=client_id
+                ),
+            )
+            return UpdateProjectOutput(project=ProjectSummary.from_project(project))
+
+        @server.tool(
+            annotations=delete_annotations,
+            structured_output=True,
+            description=(
+                "Permanently delete a project by ID. Time entries keep existing but lose "
+                "their project assignment. This is destructive."
+            ),
+        )
+        async def delete_project(
+            project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> DeletedEntityOutput:
+            await _execute(
+                "delete_project",
+                lambda: _state(context).client.delete_project(project_id),
+            )
+            return DeletedEntityOutput(deleted=True, entity_id=project_id)
+
+        @server.tool(
+            annotations=create_annotations,
+            structured_output=True,
+            description=(
+                "Create a client (customer) in the configured Toggl workspace. This changes "
+                "real Toggl data."
+            ),
+        )
+        async def create_client(
+            name: Annotated[str, Field(min_length=1, description="New client name.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> ClientSummary:
+            client = await _execute(
+                "create_client",
+                lambda: _state(context).client.create_client(name),
+            )
+            return ClientSummary.from_client(client)
+
+        @server.tool(
+            annotations=create_annotations,
+            structured_output=True,
+            description=(
+                "Create a tag in the configured Toggl workspace. This changes real Toggl data."
+            ),
+        )
+        async def create_tag(
+            name: Annotated[str, Field(min_length=1, description="New tag name.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> TagSummary:
+            tag = await _execute(
+                "create_tag",
+                lambda: _state(context).client.create_tag(name),
+            )
+            return TagSummary.from_tag(tag)
 
     return server
 

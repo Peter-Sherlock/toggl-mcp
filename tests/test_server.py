@@ -53,15 +53,36 @@ async def test_tools_list_hides_write_tools_by_default() -> None:
     async with Client(server) as client:
         result = await client.list_tools(cache_mode="bypass")
 
-    assert [tool.name for tool in result.tools] == [
-        "list_projects",
-        "get_current_timer",
-        "get_time_entries",
-    ]
+    assert [tool.name for tool in result.tools] == READ_TOOL_NAMES
     assert all(tool.output_schema is not None for tool in result.tools)
     assert result.tools[0].input_schema["properties"] == {}
     assert result.tools[0].annotations is not None
     assert result.tools[0].annotations.read_only_hint is True
+
+
+READ_TOOL_NAMES = [
+    "list_projects",
+    "get_current_timer",
+    "get_time_entries",
+    "get_time_entry",
+    "list_clients",
+    "list_tags",
+    "list_tasks",
+    "summarize_time",
+]
+WRITE_TOOL_NAMES = [
+    "start_timer",
+    "stop_timer",
+    "create_time_entry",
+    "update_time_entry",
+    "bulk_edit_time_entries",
+    "delete_time_entry",
+    "create_project",
+    "update_project",
+    "delete_project",
+    "create_client",
+    "create_tag",
+]
 
 
 @pytest.mark.asyncio
@@ -75,21 +96,27 @@ async def test_tools_list_exposes_exact_v1_surface_when_writes_are_enabled() -> 
     async with Client(server) as client:
         result = await client.list_tools(cache_mode="bypass")
 
-    assert [tool.name for tool in result.tools] == [
-        "list_projects",
-        "get_current_timer",
-        "get_time_entries",
-        "start_timer",
-        "stop_timer",
-    ]
-    start = result.tools[3]
-    stop = result.tools[4]
+    assert [tool.name for tool in result.tools] == READ_TOOL_NAMES + WRITE_TOOL_NAMES
+    by_name = {tool.name: tool for tool in result.tools}
+    start = by_name["start_timer"]
+    stop = by_name["stop_timer"]
+    delete_entry = by_name["delete_time_entry"]
+    create_entry = by_name["create_time_entry"]
+    update_entry = by_name["update_time_entry"]
     assert set(start.input_schema["properties"]) == {"description", "project_id"}
     assert start.annotations is not None
     assert start.annotations.idempotent_hint is False
     assert stop.annotations is not None
     assert stop.annotations.destructive_hint is True
     assert stop.annotations.idempotent_hint is True
+    assert create_entry.annotations is not None
+    assert create_entry.annotations.destructive_hint is False
+    assert create_entry.annotations.idempotent_hint is False
+    assert update_entry.annotations is not None
+    assert update_entry.annotations.idempotent_hint is True
+    assert delete_entry.annotations is not None
+    assert delete_entry.annotations.destructive_hint is True
+    assert delete_entry.annotations.idempotent_hint is False
 
 
 @pytest.mark.asyncio
@@ -263,3 +290,193 @@ async def test_tool_error_handles_422_validation_error() -> None:
     assert "toggl_sk_protocol-test" not in rendered
     assert "unprocessable entity" not in rendered
     assert "Traceback" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_time_entry_lifecycle_through_protocol() -> None:
+    requests: list[httpx.Request] = []
+
+    gets = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 42,
+                    "workspace_id": WORKSPACE_ID,
+                    "project_id": 88,
+                    "description": "Backfilled work",
+                    "start": "2026-08-15T09:00:00Z",
+                    "duration": 3600,
+                    "type": "activity",
+                },
+            )
+        if request.method == "PUT":
+            return httpx.Response(204)
+        if request.method == "DELETE":
+            return httpx.Response(200, text="OK")
+        gets["n"] += 1
+        description = "Backfilled work" if gets["n"] == 1 else "Renamed work"
+        return httpx.Response(
+            200,
+            json={
+                "id": 42,
+                "workspace_id": WORKSPACE_ID,
+                "project_id": 88,
+                "description": description,
+                "start": "2026-08-15T09:00:00Z",
+                "duration": 7200,
+                "type": "activity",
+            },
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=True,
+    )
+
+    async with Client(server) as client:
+        created = await client.call_tool(
+            "create_time_entry",
+            {
+                "description": "Backfilled work",
+                "start": "2026-08-15T09:00:00+00:00",
+                "duration_seconds": 3600,
+                "project_id": 88,
+            },
+        )
+        updated = await client.call_tool(
+            "update_time_entry",
+            {"entry_id": 42, "description": "Renamed work", "duration_seconds": 7200},
+        )
+        deleted = await client.call_tool("delete_time_entry", {"entry_id": 42})
+
+    assert created.is_error is False
+    assert created.structured_content is not None
+    assert created.structured_content["created"] is True
+    assert created.structured_content["time_entry"]["duration_seconds"] == 3600
+    assert updated.is_error is False
+    assert updated.structured_content is not None
+    assert updated.structured_content["time_entry"]["description"] == "Renamed work"
+    assert deleted.is_error is False
+    assert deleted.structured_content is not None
+    assert deleted.structured_content == {"deleted": True, "entity_id": 42}
+    # update = read current state, PUT merged body, read back.
+    assert [request.method for request in requests] == [
+        "POST", "GET", "PUT", "GET", "DELETE",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_list_tools_return_structured_results() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/clients"):
+            return httpx.Response(
+                200, json={"data": [{"id": 5, "name": "ACME", "wid": WORKSPACE_ID}]}
+            )
+        if request.url.path.endswith("/tags"):
+            return httpx.Response(
+                200, json=[{"id": 7, "name": "learning", "workspace_id": WORKSPACE_ID}]
+            )
+        assert request.url.path.endswith("/projects/88/tasks")
+        return httpx.Response(
+            200, json={"data": [{"id": 13, "name": "Setup", "project_id": 88}]}
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=False,
+    )
+
+    async with Client(server) as client:
+        clients = await client.call_tool("list_clients")
+        tags = await client.call_tool("list_tags")
+        tasks = await client.call_tool("list_tasks", {"project_id": 88})
+
+    assert clients.is_error is False
+    assert clients.structured_content == {
+        "count": 1,
+        "clients": [{"id": 5, "name": "ACME", "archived": False}],
+    }
+    assert tags.is_error is False
+    assert tags.structured_content == {"count": 1, "tags": [{"id": 7, "name": "learning"}]}
+    assert tasks.is_error is False
+    assert tasks.structured_content is not None
+    assert tasks.structured_content["count"] == 1
+    assert tasks.structured_content["tasks"][0]["name"] == "Setup"
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_returns_structured_groups() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/projects"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": 88, "name": "Agent Learning", "workspace_id": WORKSPACE_ID}
+                    ],
+                    "total": 1,
+                },
+            )
+        assert request.url.path.endswith("/time-entries")
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": 1,
+                        "workspace_id": WORKSPACE_ID,
+                        "project_id": 88,
+                        "description": "work",
+                        "start": "2026-08-15T09:00:00Z",
+                        "duration": 3600,
+                        "type": "activity",
+                    },
+                    {
+                        "id": 2,
+                        "workspace_id": WORKSPACE_ID,
+                        "project_id": 88,
+                        "description": "running work",
+                        "start": "2026-08-15T10:00:00Z",
+                        "type": "activity",
+                    },
+                ],
+                "total": 2,
+            },
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=False,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "summarize_time",
+            {
+                "start_date": "2026-08-15T00:00:00+00:00",
+                "end_date": "2026-08-15T23:59:59+00:00",
+                "group_by": "project",
+            },
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["tracked_seconds"] == 3600
+    assert result.structured_content["running_count"] == 1
+    assert result.structured_content["entry_count"] == 2
+    assert result.structured_content["possibly_truncated"] is False
+    assert result.structured_content["groups"] == [
+        {
+            "label": "Agent Learning",
+            "seconds": 3600,
+            "entry_count": 1,
+            "project_id": 88,
+        }
+    ]

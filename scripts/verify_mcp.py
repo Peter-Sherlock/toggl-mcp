@@ -16,8 +16,28 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp_types import CallToolResult
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-READ_TOOL_NAMES = ["list_projects", "get_current_timer", "get_time_entries"]
-WRITE_TOOL_NAMES = ["start_timer", "stop_timer"]
+READ_TOOL_NAMES = [
+    "list_projects",
+    "get_current_timer",
+    "get_time_entries",
+    "get_time_entry",
+    "list_clients",
+    "list_tags",
+    "list_tasks",
+    "summarize_time",
+]
+WRITE_TOOL_NAMES = [
+    "start_timer",
+    "stop_timer",
+    "create_time_entry",
+    "update_time_entry",
+    "delete_time_entry",
+    "create_project",
+    "update_project",
+    "delete_project",
+    "create_client",
+    "create_tag",
+]
 
 
 def _server_environment(*, enable_writes: bool) -> dict[str, str]:
@@ -91,6 +111,35 @@ async def verify(*, enable_writes: bool, list_only: bool) -> None:
             "get_time_entries",
             _structured_result("get_time_entries", entries),
         )
+
+        clients = await client.call_tool("list_clients")
+        _print_result("list_clients", _structured_result("list_clients", clients))
+
+        tags = await client.call_tool("list_tags")
+        _print_result("list_tags", _structured_result("list_tags", tags))
+
+        project_ids = [
+            project["id"]
+            for project in _structured_result("list_projects", projects)["projects"]
+        ]
+        summary = await client.call_tool(
+            "summarize_time",
+            {"start_date": start.isoformat(), "end_date": now.isoformat()},
+        )
+        _print_result(
+            "summarize_time",
+            _structured_result("summarize_time", summary),
+        )
+
+        if project_ids:
+            try:
+                tasks = await client.call_tool("list_tasks", {"project_id": project_ids[0]})
+                _print_result("list_tasks", _structured_result("list_tasks", tasks))
+            except RuntimeError as error:
+                # Expected on Toggl plans without the tasks feature (the API answers 404).
+                print(f"list_tasks: not available ({error})")
+        else:
+            print("list_tasks: skipped (no projects in workspace)")
 
 
 def main() -> None:

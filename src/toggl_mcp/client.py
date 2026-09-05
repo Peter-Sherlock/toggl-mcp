@@ -32,6 +32,7 @@ from toggl_mcp.models import (
     PlannedEntriesResult,
     PlannedTimeEntry,
     Project,
+    SearchResults,
     SummaryGroup,
     Tag,
     Task,
@@ -280,6 +281,23 @@ class TogglClient:
             count=len(entries),
             possibly_truncated=hit_page_guard,
         )
+
+    async def log_planned_entry(self, entry_id: int) -> TimeEntry:
+        """Convert a planned (calendar) entry into a logged entry, in place.
+
+        Verified against the Focus API: `POST /time-entries/{id}/log` with an empty
+        payload answers 200 with the same entry, whose `planned_start`/
+        `planned_duration` became `start`/`duration`. The logged entry stops
+        appearing in `list_planned_entries` and starts appearing in
+        `get_time_entries`.
+        """
+
+        if entry_id <= 0:
+            raise ValueError("entry_id must be a positive integer")
+        payload = await self._request_json(
+            "POST", f"{self._scope}/time-entries/{entry_id}/log", json={}
+        )
+        return self._validate(TimeEntry, self._unwrap_data(payload))
 
     async def summarize_time(
         self,
@@ -555,6 +573,43 @@ class TogglClient:
             update={"running": False}
         )
 
+    async def continue_timer(self, description: str) -> TimeEntry:
+        """Start a timer for a description, restoring the context of recent matches.
+
+        Verified against the Focus API: `POST /tracking/start-from-description` takes
+        `{name, extension_source, type}` and starts a timer for the description — a
+        fresh description works too, while a description matching recent entries lets
+        upstream restore that context. The response is a `{time_entry, task?}`
+        envelope; only the started entry is returned. The caller checks for a running
+        timer first, like `start_timer`.
+        """
+
+        clean_description = description.strip()
+        if not clean_description:
+            raise ValueError("description must not be empty")
+
+        current = await self.get_current_timer()
+        if current is not None:
+            raise TimerAlreadyRunningError(current.id)
+
+        payload = await self._request_json(
+            "POST",
+            f"{self._scope}/tracking/start-from-description",
+            json={
+                "name": clean_description,
+                # Verified against the real API: all three fields are required; the
+                # extension source identifies the calling integration.
+                "extension_source": "toggl-mcp",
+                "type": "activity",
+            },
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("time_entry"), dict):
+            raise TogglResponseFormatError(
+                "Expected a time_entry object from the start-from-description endpoint."
+            )
+        entry = self._validate(TimeEntry, payload["time_entry"])
+        return entry.model_copy(update={"running": True})
+
     async def get_time_entry(self, entry_id: int) -> TimeEntry:
         """Read one time entry of the configured workspace by ID."""
 
@@ -562,6 +617,27 @@ class TogglClient:
             raise ValueError("entry_id must be a positive integer")
         payload = await self._request_json("GET", f"{self._scope}/time-entries/{entry_id}")
         return self._validate(TimeEntry, self._unwrap_data(payload))
+
+    async def search(self, keyword: str, *, per_group: int = 5) -> SearchResults:
+        """Search the workspace across time entries, tasks, and projects.
+
+        Verified against the Focus API: `GET /search?keyword=` answers three
+        suggestion groups. Time-entry hits are deduplicated suggestion rows that
+        carry no entry IDs — resolve exact entries with `get_time_entries`
+        afterwards. Upstream requires at least 3 characters (also enforced here).
+        """
+
+        clean_keyword = keyword.strip()
+        if len(clean_keyword) < 3:
+            raise ValueError("search keyword must be at least 3 characters")
+        if not 1 <= per_group <= 10:
+            raise ValueError("per_group must be between 1 and 10")
+        payload = await self._request_json(
+            "GET",
+            f"{self._scope}/search",
+            params={"keyword": clean_keyword, "per_group": per_group},
+        )
+        return self._validate(SearchResults, self._unwrap_data(payload))
 
     async def create_time_entry(
         self,
@@ -889,6 +965,21 @@ class TogglClient:
             raise ValueError("entry_id must be a positive integer")
         await self._request_ok("DELETE", f"{self._scope}/time-entries/{entry_id}")
 
+    async def restore_time_entry(self, entry_id: int) -> TimeEntry:
+        """Restore a soft-deleted time entry of the configured workspace.
+
+        Verified against the Focus API: single deletes are soft; `PATCH
+        /time-entries/{id}/restore` answers an empty 204 and the entry becomes
+        readable again. The restored entry is re-read and returned.
+        """
+
+        if entry_id <= 0:
+            raise ValueError("entry_id must be a positive integer")
+        await self._request_ok(
+            "PATCH", f"{self._scope}/time-entries/{entry_id}/restore", json={}
+        )
+        return await self.get_time_entry(entry_id)
+
     async def create_project(
         self,
         name: str,
@@ -977,6 +1068,41 @@ class TogglClient:
         )
         return self._validate(Client, self._unwrap_data(payload))
 
+    async def update_client(self, client_id: int, *, name: str) -> Client:
+        """Rename a client of the configured workspace.
+
+        Verified against the Focus API: the route answers only to PUT (PATCH is a
+        405), the PUT payload requires `name`, and the answer is an empty 204 — so
+        the client is re-read afterwards. Archive state is deliberately not offered:
+        the upstream PUT accepts `name` only and silently ignores both `archived`
+        and `active` (verified live).
+        """
+
+        if client_id <= 0:
+            raise ValueError("client_id must be a positive integer")
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("name must not be empty")
+        await self._request_ok(
+            "PUT", f"{self._ws_scope}/clients/{client_id}", json={"name": clean_name}
+        )
+        return await self.get_client(client_id)
+
+    async def get_client(self, client_id: int) -> Client:
+        """Read one client (customer) of the configured workspace by ID."""
+
+        if client_id <= 0:
+            raise ValueError("client_id must be a positive integer")
+        payload = await self._request_json("GET", f"{self._ws_scope}/clients/{client_id}")
+        return self._validate(Client, self._unwrap_data(payload))
+
+    async def delete_client(self, client_id: int) -> None:
+        """Permanently delete a client of the configured workspace."""
+
+        if client_id <= 0:
+            raise ValueError("client_id must be a positive integer")
+        await self._request_ok("DELETE", f"{self._ws_scope}/clients/{client_id}")
+
     async def list_tags(self) -> list[Tag]:
         """Return all tags of the configured workspace."""
 
@@ -994,6 +1120,51 @@ class TogglClient:
             "POST", f"{self._ws_scope}/tags", json={"name": clean_name}
         )
         return self._validate(Tag, self._unwrap_data(payload))
+
+    async def update_tag(
+        self,
+        tag_id: int,
+        *,
+        name: str | None = None,
+        color: str | None = None,
+    ) -> Tag:
+        """Update a tag; fields left as None stay unchanged.
+
+        Verified against the Focus API: the route answers only to PUT (PATCH is a
+        405) and PUT accepts `{name, color}`, answering with the updated tag. The
+        current state is read first so omitted fields keep their values.
+        """
+
+        if tag_id <= 0:
+            raise ValueError("tag_id must be a positive integer")
+        if name is None and color is None:
+            raise ValueError("update_tag requires at least one field to change")
+        if name is not None and not name.strip():
+            raise ValueError("name must not be empty when provided")
+        current = await self.get_tag(tag_id)
+        body: dict[str, JsonValue] = {
+            "name": (name or current.name).strip(),
+            "color": color if color is not None else current.color,
+        }
+        payload = await self._request_json(
+            "PUT", f"{self._ws_scope}/tags/{tag_id}", json=body
+        )
+        return self._validate(Tag, self._unwrap_data(payload))
+
+    async def get_tag(self, tag_id: int) -> Tag:
+        """Read one tag of the configured workspace by ID."""
+
+        if tag_id <= 0:
+            raise ValueError("tag_id must be a positive integer")
+        payload = await self._request_json("GET", f"{self._ws_scope}/tags/{tag_id}")
+        return self._validate(Tag, self._unwrap_data(payload))
+
+    async def delete_tag(self, tag_id: int) -> None:
+        """Permanently delete a tag of the configured workspace."""
+
+        if tag_id <= 0:
+            raise ValueError("tag_id must be a positive integer")
+        await self._request_ok("DELETE", f"{self._ws_scope}/tags/{tag_id}")
 
     async def list_tasks(self, project_id: int) -> list[Task]:
         """Return all tasks of one project.

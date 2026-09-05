@@ -49,10 +49,16 @@ from toggl_mcp.tool_models import (
     ListTagsOutput,
     ListTasksOutput,
     ListWorkspaceMembersOutput,
+    LogPlannedEntryOutput,
     MemberSummary,
     MeSettingsOutput,
     PlannedEntrySummary,
     ProjectSummary,
+    RestoreTimeEntryOutput,
+    SearchOutput,
+    SearchProjectSummary,
+    SearchTaskSummary,
+    SearchTimeEntrySummary,
     StartTimerOutput,
     StopTimerOutput,
     SummarizeTimeOutput,
@@ -286,6 +292,68 @@ def create_server(
         annotations=read_annotations,
         structured_output=True,
         description=(
+            "Search the workspace across time entries, tasks, and projects by keyword "
+            "(at least 3 characters). Time-entry hits are deduplicated suggestions "
+            "without entry IDs; use get_time_entries over the surrounding interval to "
+            "resolve exact entry IDs."
+        ),
+    )
+    async def search(
+        keyword: Annotated[
+            str,
+            Field(min_length=3, description="Search term, at least 3 characters."),
+        ],
+        per_group: Annotated[
+            int,
+            Field(ge=1, le=10, description="Max results per group."),
+        ] = 5,
+        *,
+        context: Context[ServerState, Any],
+    ) -> SearchOutput:
+        results = await _execute(
+            "search",
+            lambda: _state(context).client.search(keyword, per_group=per_group),
+        )
+        return SearchOutput(
+            keyword=keyword.strip(),
+            time_entries=[
+                SearchTimeEntrySummary(
+                    description=hit.description,
+                    project_id=hit.project_id,
+                    project_name=hit.project_name,
+                    task_name=hit.task_name,
+                    client_name=hit.client_name,
+                    last_tracked_at=hit.last_tracked_at,
+                    matched_terms=hit.matched_terms,
+                )
+                for hit in results.time_entries
+            ],
+            tasks=[
+                SearchTaskSummary(
+                    id=hit.id,
+                    name=hit.name,
+                    project_name=hit.project_name,
+                    client_name=hit.client_name,
+                    matched_terms=hit.matched_terms,
+                )
+                for hit in results.tasks
+            ],
+            projects=[
+                SearchProjectSummary(
+                    id=hit.id,
+                    name=hit.name,
+                    color=hit.color,
+                    client_name=hit.client_name,
+                    matched_terms=hit.matched_terms,
+                )
+                for hit in results.projects
+            ],
+        )
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
             "List clients (customers) of the configured Toggl workspace. Client IDs are "
             "accepted by create_project."
         ),
@@ -464,6 +532,31 @@ def create_server(
             timer = await _execute(
                 "start_timer",
                 lambda: _state(context).client.start_timer(description, project_id),
+            )
+            return StartTimerOutput(timer=TimeEntrySummary.from_time_entry(timer))
+
+        @server.tool(
+            annotations=start_annotations,
+            structured_output=True,
+            description=(
+                "Start a timer for a description, letting Toggl restore the context "
+                "(project, tags) of recent entries with the same description — the "
+                "'continue timer' behavior. A brand-new description starts a plain "
+                "timer. Checks for an already-running timer first; that check is "
+                "best-effort. To control the project explicitly, use start_timer."
+            ),
+        )
+        async def continue_timer(
+            description: Annotated[
+                str,
+                Field(min_length=1, description="Description of the timer to continue."),
+            ],
+            *,
+            context: Context[ServerState, Any],
+        ) -> StartTimerOutput:
+            timer = await _execute(
+                "continue_timer",
+                lambda: _state(context).client.continue_timer(description),
             )
             return StartTimerOutput(timer=TimeEntrySummary.from_time_entry(timer))
 
@@ -656,6 +749,54 @@ def create_server(
             )
 
         @server.tool(
+            annotations=create_annotations,
+            structured_output=True,
+            description=(
+                "Restore a soft-deleted time entry by ID, returning its current state. "
+                "This changes real Toggl data."
+            ),
+        )
+        async def restore_time_entry(
+            entry_id: Annotated[int, Field(gt=0, description="Exact Toggl time-entry ID.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> RestoreTimeEntryOutput:
+            timer = await _execute(
+                "restore_time_entry",
+                lambda: _state(context).client.restore_time_entry(entry_id),
+            )
+            return RestoreTimeEntryOutput(
+                restored=True,
+                time_entry=TimeEntrySummary.from_time_entry(timer),
+            )
+
+        @server.tool(
+            annotations=create_annotations,
+            structured_output=True,
+            description=(
+                "Log a planned (calendar) entry as tracked time: its planned start and "
+                "duration become the real start and duration. The entry stops appearing "
+                "in list_planned_entries. This changes real Toggl data."
+            ),
+        )
+        async def log_planned_entry(
+            entry_id: Annotated[
+                int,
+                Field(gt=0, description="Exact planned-entry ID from list_planned_entries."),
+            ],
+            *,
+            context: Context[ServerState, Any],
+        ) -> LogPlannedEntryOutput:
+            timer = await _execute(
+                "log_planned_entry",
+                lambda: _state(context).client.log_planned_entry(entry_id),
+            )
+            return LogPlannedEntryOutput(
+                logged=True,
+                time_entry=TimeEntrySummary.from_time_entry(timer),
+            )
+
+        @server.tool(
             annotations=delete_annotations,
             structured_output=True,
             description=(
@@ -766,6 +907,45 @@ def create_server(
             return ClientSummary.from_client(client)
 
         @server.tool(
+            annotations=update_annotations,
+            structured_output=True,
+            description=(
+                "Rename a client by ID. The upstream route offers renaming only — "
+                "archive state changes are silently ignored by Toggl, so they are not "
+                "offered. This changes real Toggl data."
+            ),
+        )
+        async def update_client(
+            client_id: Annotated[int, Field(gt=0, description="Exact Toggl client ID.")],
+            name: Annotated[str, Field(min_length=1, description="New client name.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> ClientSummary:
+            client = await _execute(
+                "update_client",
+                lambda: _state(context).client.update_client(client_id, name=name),
+            )
+            return ClientSummary.from_client(client)
+
+        @server.tool(
+            annotations=delete_annotations,
+            structured_output=True,
+            description=(
+                "Permanently delete a client by ID. This is destructive."
+            ),
+        )
+        async def delete_client(
+            client_id: Annotated[int, Field(gt=0, description="Exact Toggl client ID.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> DeletedEntityOutput:
+            await _execute(
+                "delete_client",
+                lambda: _state(context).client.delete_client(client_id),
+            )
+            return DeletedEntityOutput(deleted=True, entity_id=client_id)
+
+        @server.tool(
             annotations=create_annotations,
             structured_output=True,
             description=(
@@ -782,6 +962,48 @@ def create_server(
                 lambda: _state(context).client.create_tag(name),
             )
             return TagSummary.from_tag(tag)
+
+        @server.tool(
+            annotations=update_annotations,
+            structured_output=True,
+            description=(
+                "Update a tag by ID: rename it or recolor it. Omitted fields stay "
+                "unchanged. This changes real Toggl data."
+            ),
+        )
+        async def update_tag(
+            tag_id: Annotated[int, Field(gt=0, description="Exact Toggl tag ID.")],
+            name: Annotated[str | None, Field(min_length=1)] = None,
+            color: Annotated[
+                str | None, Field(description="Hex color for the tag.")
+            ] = None,
+            *,
+            context: Context[ServerState, Any],
+        ) -> TagSummary:
+            tag = await _execute(
+                "update_tag",
+                lambda: _state(context).client.update_tag(tag_id, name=name, color=color),
+            )
+            return TagSummary.from_tag(tag)
+
+        @server.tool(
+            annotations=delete_annotations,
+            structured_output=True,
+            description=(
+                "Permanently delete a tag by ID. Entries keep existing but lose this "
+                "tag. This is destructive."
+            ),
+        )
+        async def delete_tag(
+            tag_id: Annotated[int, Field(gt=0, description="Exact Toggl tag ID.")],
+            *,
+            context: Context[ServerState, Any],
+        ) -> DeletedEntityOutput:
+            await _execute(
+                "delete_tag",
+                lambda: _state(context).client.delete_tag(tag_id),
+            )
+            return DeletedEntityOutput(deleted=True, entity_id=tag_id)
 
     return server
 

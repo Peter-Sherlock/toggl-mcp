@@ -22,6 +22,7 @@ READ_TOOL_NAMES = [
     "get_time_entries",
     "get_time_entry",
     "list_planned_entries",
+    "search",
     "list_clients",
     "list_tags",
     "list_tasks",
@@ -31,17 +32,24 @@ READ_TOOL_NAMES = [
 ]
 WRITE_TOOL_NAMES = [
     "start_timer",
+    "continue_timer",
     "stop_timer",
     "create_time_entry",
     "update_time_entry",
     "bulk_edit_time_entries",
     "bulk_delete_time_entries",
+    "restore_time_entry",
+    "log_planned_entry",
     "delete_time_entry",
     "create_project",
     "update_project",
     "delete_project",
     "create_client",
+    "update_client",
+    "delete_client",
     "create_tag",
+    "update_tag",
+    "delete_tag",
 ]
 
 
@@ -125,6 +133,9 @@ async def verify(*, enable_writes: bool, list_only: bool) -> None:
             "list_planned_entries",
             _structured_result("list_planned_entries", planned),
         )
+
+        search = await client.call_tool("search", {"keyword": "toggl"})
+        _print_result("search", _structured_result("search", search))
 
         clients = await client.call_tool("list_clients")
         _print_result("list_clients", _structured_result("list_clients", clients))

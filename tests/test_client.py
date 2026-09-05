@@ -17,6 +17,7 @@ from toggl_mcp.exceptions import (
     TogglRequestValidationError,
 )
 from toggl_mcp.models import BulkDeleteOutcome, BulkEditOutcome
+from toggl_mcp.models import Client as ClientModel
 
 ORGANIZATION_ID = 321
 WORKSPACE_ID = 123
@@ -455,6 +456,262 @@ async def test_list_planned_entries_rejects_naive_dates_before_network_call() ->
             await client.list_planned_entries(datetime(2026, 8, 15), NOW)
         with pytest.raises(ValueError, match="before or equal"):
             await client.list_planned_entries(NOW, datetime(2026, 8, 14, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+async def test_search_maps_three_suggestion_groups() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "time_entries": [
+                    {
+                        "description": "leetcode practice",
+                        "project_id": 88,
+                        "project_name": "Agent Learning",
+                        "tag_ids": None,
+                        "last_tracked_at": "2026-08-18T03:30:00Z",
+                        "matched_terms": 1,
+                    }
+                ],
+                "tasks": [],
+                "projects": [
+                    {
+                        "id": 88,
+                        "name": "Agent Learning",
+                        "color": "#E54C87",
+                        "matched_terms": 1,
+                    }
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        results = await client.search("leetcode", per_group=3)
+
+    assert requests[0].url.path == f"{SCOPE}/search"
+    assert requests[0].url.params["keyword"] == "leetcode"
+    assert requests[0].url.params["per_group"] == "3"
+    assert results.projects[0].id == 88
+    assert results.tasks == []
+    hit = results.time_entries[0]
+    assert hit.description == "leetcode practice"
+    assert hit.tag_ids == []
+    assert hit.last_tracked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_search_validates_keyword_and_per_group_before_network() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("network should not be called")
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        with pytest.raises(ValueError, match="at least 3"):
+            await client.search("ab")
+        with pytest.raises(ValueError, match="per_group"):
+            await client.search("abc", per_group=11)
+
+
+@pytest.mark.asyncio
+async def test_continue_timer_preflights_and_posts_verified_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tracking/current"):
+            return httpx.Response(204)
+        assert request.url.path == f"{SCOPE}/tracking/start-from-description"
+        return httpx.Response(
+            200,
+            json={
+                "time_entry": running_entry(entry_id=91),
+                "task": {"id": 55, "name": "auto"},
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport, clock=lambda: NOW) as client:
+        started = await client.continue_timer("  MCP learning  ")
+
+    body = json.loads(requests[-1].content)
+    assert body == {
+        "name": "MCP learning",
+        "extension_source": "toggl-mcp",
+        "type": "activity",
+    }
+    assert started.id == 91
+    assert started.is_running is True
+
+
+@pytest.mark.asyncio
+async def test_continue_timer_refuses_when_one_is_running() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=running_entry(entry_id=77))
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        with pytest.raises(TimerAlreadyRunningError):
+            await client.continue_timer("MCP learning")
+
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_log_planned_entry_converts_in_place() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == f"{SCOPE}/time-entries/30/log"
+        return httpx.Response(
+            200,
+            json={
+                "id": 30,
+                "workspace_id": WORKSPACE_ID,
+                "description": "leetcode",
+                # Verified: the same ID comes back with start/duration filled from
+                # the plan, and the planned_* fields preserved.
+                "start": "2026-08-18T01:30:00Z",
+                "duration": 3600,
+                "planned_start": "2026-08-18T01:30:00Z",
+                "planned_duration": 3600,
+                "type": "activity",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        logged = await client.log_planned_entry(30)
+
+    assert logged.id == 30
+    assert logged.duration == 3600
+    assert logged.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_restore_time_entry_restores_and_rereads() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "PATCH":
+            assert request.url.path == f"{SCOPE}/time-entries/42/restore"
+            return httpx.Response(204)
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            json={
+                "id": 42,
+                "workspace_id": WORKSPACE_ID,
+                "description": "Back again",
+                "start": "2026-08-15T09:00:00Z",
+                "duration": 600,
+                "type": "activity",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        restored = await client.restore_time_entry(42)
+
+    assert restored.description == "Back again"
+    assert [request.method for request in requests] == ["PATCH", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_update_client_puts_name_and_rereads() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 9,
+                    "workspace_id": WORKSPACE_ID,
+                    "name": "Renamed",
+                    "active": True,
+                },
+            )
+        assert request.method == "PUT"
+        assert request.url.path == f"{WSCOPE}/clients/9"
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        updated = await client.update_client(9, name="  Renamed  ")
+
+    put_body = json.loads(requests[0].content)
+    # The PUT payload carries exactly the renamed value, nothing else.
+    assert put_body == {"name": "Renamed"}
+    assert updated.name == "Renamed"
+    assert [request.method for request in requests] == ["PUT", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_update_tag_merges_name_and_color_and_rejects_empty_changes() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"id": 7, "name": "learning", "color": None}
+            )
+        assert request.method == "PUT"
+        assert request.url.path == f"{WSCOPE}/tags/7"
+        return httpx.Response(
+            200, json={"id": 7, "name": "learning", "color": "#AA33CC"}
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        tag = await client.update_tag(7, color="#AA33CC")
+
+    put_body = json.loads(requests[-1].content)
+    # The current name is re-sent because the PUT payload always carries it.
+    assert put_body == {"name": "learning", "color": "#AA33CC"}
+    assert tag.color == "#AA33CC"
+
+    async with TogglClient(config(), transport=transport) as client:
+        with pytest.raises(ValueError, match="at least one field"):
+            await client.update_tag(7)
+
+
+@pytest.mark.asyncio
+async def test_delete_client_and_delete_tag_use_workspace_scope() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        await client.delete_client(9)
+        await client.delete_tag(7)
+
+    assert [r.url.path for r in requests] == [
+        f"{WSCOPE}/clients/9",
+        f"{WSCOPE}/tags/7",
+    ]
+
+
+def test_client_archived_is_derived_from_active() -> None:
+    active = ClientModel.model_validate({"id": 1, "name": "A", "active": True})
+    inactive = ClientModel.model_validate({"id": 2, "name": "B", "active": False})
+    assert active.archived is False
+    assert inactive.archived is True
 
 
 @pytest.mark.asyncio

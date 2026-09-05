@@ -66,6 +66,7 @@ READ_TOOL_NAMES = [
     "get_time_entries",
     "get_time_entry",
     "list_planned_entries",
+    "search",
     "list_clients",
     "list_tags",
     "list_tasks",
@@ -75,17 +76,24 @@ READ_TOOL_NAMES = [
 ]
 WRITE_TOOL_NAMES = [
     "start_timer",
+    "continue_timer",
     "stop_timer",
     "create_time_entry",
     "update_time_entry",
     "bulk_edit_time_entries",
     "bulk_delete_time_entries",
+    "restore_time_entry",
+    "log_planned_entry",
     "delete_time_entry",
     "create_project",
     "update_project",
     "delete_project",
     "create_client",
+    "update_client",
+    "delete_client",
     "create_tag",
+    "update_tag",
+    "delete_tag",
 ]
 
 
@@ -521,6 +529,135 @@ async def test_bulk_delete_time_entries_returns_per_entry_outcomes() -> None:
     assert outcomes[1]["deleted"] is False
     assert "still exists" in (outcomes[1]["error"] or "")
     assert [request.method for request in requests] == ["GET", "DELETE", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_search_returns_structured_suggestions() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        assert request.url.path.endswith("/search")
+        return httpx.Response(
+            200,
+            json={
+                "time_entries": [
+                    {
+                        "description": "leetcode practice",
+                        "project_id": 88,
+                        "project_name": "Agent Learning",
+                        "tag_ids": None,
+                        "last_tracked_at": "2026-08-18T03:30:00Z",
+                        "matched_terms": 1,
+                    }
+                ],
+                "tasks": [],
+                "projects": [{"id": 88, "name": "Agent Learning", "matched_terms": 1}],
+            },
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=False,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "search", {"keyword": "leetcode", "per_group": 3}
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["keyword"] == "leetcode"
+    assert result.structured_content["projects"][0]["id"] == 88
+    hit = result.structured_content["time_entries"][0]
+    assert hit["description"] == "leetcode practice"
+    assert hit["project_name"] == "Agent Learning"
+    assert captured[0].url.params["keyword"] == "leetcode"
+
+
+@pytest.mark.asyncio
+async def test_continue_timer_starts_via_native_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tracking/current"):
+            return httpx.Response(204)
+        assert request.url.path.endswith("/tracking/start-from-description")
+        return httpx.Response(
+            200,
+            json={"time_entry": running_entry(entry_id=91), "task": None},
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=True,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "continue_timer", {"description": "MCP learning"}
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["started"] is True
+    assert result.structured_content["timer"]["is_running"] is True
+    body = json.loads(requests[-1].content)
+    assert body == {
+        "name": "MCP learning",
+        "extension_source": "toggl-mcp",
+        "type": "activity",
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_client_and_delete_tag_round_trip() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/clients/5"):
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": 5,
+                        "workspace_id": WORKSPACE_ID,
+                        "name": "Renamed",
+                        "active": True,
+                    },
+                )
+            assert request.method == "PUT"
+            return httpx.Response(204)
+        assert request.method == "DELETE"
+        assert request.url.path.endswith("/tags/7")
+        return httpx.Response(204)
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=True,
+    )
+
+    async with Client(server) as client:
+        updated = await client.call_tool(
+            "update_client", {"client_id": 5, "name": "Renamed"}
+        )
+        deleted = await client.call_tool("delete_tag", {"tag_id": 7})
+
+    assert updated.is_error is False
+    assert updated.structured_content == {
+        "id": 5,
+        "name": "Renamed",
+        "archived": False,
+    }
+    assert deleted.structured_content == {"deleted": True, "entity_id": 7}
+    put_body = json.loads(requests[0].content)
+    assert put_body == {"name": "Renamed"}
 
 
 @pytest.mark.asyncio

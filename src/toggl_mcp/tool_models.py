@@ -350,6 +350,68 @@ class ListWorkspaceMembersOutput(ToolOutput):
     members: list[MemberSummary]
 
 
+class SearchTimeEntrySummary(ToolOutput):
+    """Suggestion-style time-entry hit; carries no entry ID."""
+
+    description: str | None = Field(description="Matched entry description.")
+    project_id: int | None = Field(description="Project of the matched description, if any.")
+    project_name: str | None = Field(description="Project name, if any.")
+    task_name: str | None = Field(description="Task name, if any.")
+    client_name: str | None = Field(description="Client name of the project, if any.")
+    last_tracked_at: datetime | None = Field(
+        description="When this description was last tracked; narrow get_time_entries "
+        "with it to resolve exact entry IDs."
+    )
+    matched_terms: int = Field(description="How many search terms this hit matched.")
+
+
+class SearchProjectSummary(ToolOutput):
+    """One project hit of a workspace search."""
+
+    id: int = Field(description="Toggl project ID, accepted by start_timer.")
+    name: str = Field(description="Human-readable project name.")
+    color: str | None = Field(description="Project color, if set.")
+    client_name: str | None = Field(description="Client name, if any.")
+    matched_terms: int = Field(description="How many search terms this hit matched.")
+
+
+class SearchTaskSummary(ToolOutput):
+    """One task hit of a workspace search."""
+
+    id: int = Field(description="Toggl task ID.")
+    name: str = Field(description="Human-readable task name.")
+    project_name: str | None = Field(description="Project the task belongs to, if any.")
+    client_name: str | None = Field(description="Client name of the project, if any.")
+    matched_terms: int = Field(description="How many search terms this hit matched.")
+
+
+class SearchOutput(ToolOutput):
+    """Unified workspace search across time entries, tasks, and projects.
+
+    Time-entry hits are deduplicated suggestions without entry IDs; resolve exact
+    entries with get_time_entries over the surrounding interval.
+    """
+
+    keyword: str = Field(description="The search term that was used.")
+    time_entries: list[SearchTimeEntrySummary]
+    tasks: list[SearchTaskSummary]
+    projects: list[SearchProjectSummary]
+
+
+class LogPlannedEntryOutput(ToolOutput):
+    """Confirmation that a planned entry was logged as tracked time."""
+
+    logged: bool = Field(default=True)
+    time_entry: TimeEntrySummary
+
+
+class RestoreTimeEntryOutput(ToolOutput):
+    """Confirmation and backend representation of a restored time entry."""
+
+    restored: bool = Field(default=True)
+    time_entry: TimeEntrySummary
+
+
 class SummaryGroupOutput(ToolOutput):
     """One aggregation bucket of a time summary."""
 

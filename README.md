@@ -15,6 +15,8 @@ Read tools are exposed by default:
 - `get_time_entry(entry_id)`
 - `list_planned_entries(start_date, end_date)` — calendar-scheduled entries that do not
   carry tracked time yet.
+- `search(keyword, per_group=5)` — unified search across time entries, tasks, and
+  projects.
 - `list_clients()`
 - `list_tags()`
 - `list_tasks(project_id)` — requires a Toggl plan with the tasks feature; other plans
@@ -63,20 +65,60 @@ aggregation happens server-side; the client resolves labels and exact entry tota
   answer with an empty page. The client caps `page_size` at 100, so this cannot be
   triggered through configuration.
 
+### Search, continue, restore, and planned-logging semantics
+
+- `search` backs onto `GET /organizations/{oid}/workspaces/{wid}/search?keyword=`
+  (minimum 3 characters, verified live). The three answer groups are suggestion-style:
+  project hits carry IDs, but time-entry hits are deduplicated description suggestions
+  without entry IDs — resolve exact entries with `get_time_entries` over the interval
+  around `last_tracked_at`.
+- `continue_timer` backs onto `POST /tracking/start-from-description`, whose payload
+  was discovered through upstream validation errors: `{name, extension_source, type}`
+  are all required. A description matching recent entries lets upstream restore that
+  context; a brand-new description starts a plain timer. A running-timer preflight
+  (like `start_timer`) refuses before any request.
+- `log_planned_entry` backs onto `POST /time-entries/{id}/log` with an empty payload:
+  verified live, the same entry ID comes back with `planned_start`/`planned_duration`
+  turned into `start`/`duration`, so the entry moves from the planned view into the
+  tracked view.
+- Time-entry deletion is soft: verified live, `PATCH /time-entries/{id}/restore`
+  answers an empty 204 and the entry becomes readable again, which `restore_time_entry`
+  confirms by re-reading. Creating planned entries through the create endpoint works
+  too (`planned_start`/`planned_duration` instead of `start`/`duration`).
+
+### Client and tag mutation semantics
+
+- Both `.../clients/{id}` and `.../tags/{id}` answer PATCH with 405 — the update verb
+  is PUT.
+- `PUT /clients/{id}` requires `name` in the payload and answers an empty 204;
+  verified live, it silently ignores both `archived` and `active`, so `update_client`
+  deliberately offers renaming only. Client state is read as `active` upstream and
+  exposed to agents as the inverse `archived` flag.
+- `PUT /tags/{id}` accepts `{name, color}` and answers with the updated tag;
+  `update_tag` reads the current state first so omitted fields keep their values.
+- `DELETE` on both routes answers an empty 204.
+
 Write tools are exposed only when `TOGGL_ENABLE_WRITE_TOOLS=true`:
 
 - `start_timer(description, project_id=None)`
+- `continue_timer(description)`
 - `stop_timer()`
 - `create_time_entry(description, start, duration_seconds, project_id=None, tags=None, billable=False)`
 - `update_time_entry(entry_id, description=None, project_id=None, tags=None, start=None, duration_seconds=None)`
 - `bulk_edit_time_entries(entry_ids, add_tags=None, remove_tags=None, project_id=None)`
 - `bulk_delete_time_entries(entry_ids)`
+- `restore_time_entry(entry_id)`
+- `log_planned_entry(entry_id)`
 - `delete_time_entry(entry_id)`
 - `create_project(name, active=True, client_id=None, color=None, is_private=True)`
 - `update_project(project_id, name=None, active=None, client_id=None)`
 - `delete_project(project_id)`
 - `create_client(name)`
+- `update_client(client_id, name)`
+- `delete_client(client_id)`
 - `create_tag(name)`
+- `update_tag(tag_id, name=None, color=None)`
+- `delete_tag(tag_id)`
 
 The server hides organization/workspace IDs, pagination, API timestamps for mutations, and raw
 Toggl response fields from the agent-facing schemas. Tool results use explicit Pydantic output
@@ -155,8 +197,9 @@ The canonical `api.track.toggl.com/api/v9` host rejects `toggl_sk_` credentials 
 Bearer / 403 Basic); those keys are Focus API tokens and only work against
 `focus.toggl.com/api`.
 
-Project, client, and tag mutations are covered by offline protocol tests but have not
-been exercised against the live account.
+Project mutations are covered by offline protocol tests but have not been exercised
+against the live account. Client and tag mutations (create, update, delete) plus the
+whole time-entry lifecycle, including restore, are verified against the live account.
 
 Write operations against the live account are intentionally not exercised by automated
 verification; they change real Toggl data.
@@ -210,7 +253,7 @@ The repository's parent workspace contains a project-scoped Codex configuration 
 server over stdio with the locked uv environment and loads secrets from this project's `.env`.
 The API key is not copied into Codex configuration.
 
-The configuration allowlists exactly the twenty-three registered tools. Its `writes` approval
+The configuration allowlists exactly the thirty-one registered tools. Its `writes` approval
 policy allows the read-only tools without a write approval and asks for approval before any
 write tool runs. A drift test (`tests/test_codex_config.py`) fails when `enabled_tools`
 no longer matches the registered tool surface. Run `/mcp` in Codex to inspect the connected

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Tag(BaseModel):
@@ -34,13 +34,24 @@ class Project(BaseModel):
 
 
 class Client(BaseModel):
-    """Toggl client (customer) as returned by the workspace clients endpoint."""
+    """Toggl client (customer) as returned by the workspace clients endpoint.
+
+    The Focus API reports client state as `active`; agents reason about the inverse
+    `archived` flag, so it is derived here and stays the single source of truth.
+    """
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     id: int
     name: str
     archived: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_archived_from_active(cls, data: object) -> object:
+        if isinstance(data, dict) and "archived" not in data and "active" in data:
+            data = {**data, "archived": not data["active"]}
+        return data
 
 
 class Task(BaseModel):
@@ -241,3 +252,66 @@ class TimeSummary(BaseModel):
     running_count: int
     possibly_truncated: bool
     groups: list[SummaryGroup]
+
+
+class SearchTimeEntryResult(BaseModel):
+    """Suggestion-style search hit for time entries; carries no entry ID.
+
+    Verified against the real API: the search endpoint deduplicates time-entry hits
+    into suggestion rows, so exact entries must be resolved through the range
+    endpoint afterwards.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    description: str | None = None
+    project_id: int | None = None
+    project_name: str | None = None
+    task_id: int | None = None
+    task_name: str | None = None
+    client_name: str | None = None
+    tag_ids: list[int] = Field(default_factory=list)
+    last_tracked_at: datetime | None = None
+    matched_terms: int = 0
+
+    @field_validator("tag_ids", mode="before")
+    @classmethod
+    def normalize_null_lists(cls, value: object) -> object:
+        if value is None:
+            return []
+        return value
+
+
+class SearchProjectResult(BaseModel):
+    """One project hit of a workspace search."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: int
+    name: str
+    color: str | None = None
+    client_name: str | None = None
+    matched_terms: int = 0
+
+
+class SearchTaskResult(BaseModel):
+    """One task hit of a workspace search."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: int
+    name: str
+    project_id: int | None = None
+    project_name: str | None = None
+    client_name: str | None = None
+    matched_terms: int = 0
+
+
+class SearchResults(BaseModel):
+    """The three suggestion groups of a workspace search."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    time_entries: list[SearchTimeEntryResult] = Field(default_factory=list)
+    tasks: list[SearchTaskResult] = Field(default_factory=list)
+    projects: list[SearchProjectResult] = Field(default_factory=list)

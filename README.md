@@ -13,30 +13,55 @@ Read tools are exposed by default:
 - `get_current_timer()`
 - `get_time_entries(start_date, end_date)`
 - `get_time_entry(entry_id)`
+- `list_planned_entries(start_date, end_date)` — calendar-scheduled entries that do not
+  carry tracked time yet.
 - `list_clients()`
 - `list_tags()`
 - `list_tasks(project_id)` — requires a Toggl plan with the tasks feature; other plans
   answer 404, which surfaces as a clean "not found" tool error.
 - `summarize_time(start_date, end_date, group_by="project"|"date"|"tag")`
+- `get_me()` — the authenticated user's settings, including the workspace they have
+  selected in Toggl.
+- `list_workspace_members()` — the organization's members with their workspace
+  membership.
 
 ### Time summary semantics
 
-`summarize_time` aggregates the raw range query client-side, so its output is always
-consistent with `get_time_entries` and the truncation signal carries over:
+`summarize_time` is powered by the Focus API's native report engine
+(`POST /reports/workspaces/{wid}/query`), discovered in the official OpenAPI spec. All
+aggregation happens server-side; the client resolves labels and exact entry totals:
 
-- Still-running entries (null or negative duration) are counted in `running_count` but
-  excluded from `tracked_seconds` because their durations are not final.
-- `possibly_truncated` is propagated from the underlying query; when true, every total is
-  a lower bound and agents should narrow the interval before reporting.
-- Tag grouping attributes one entry's full duration to each of its tags, so group sums
-  can exceed `tracked_seconds`.
-- Date grouping uses the UTC calendar date of each entry's start.
-- Project grouping resolves project IDs to names via one extra projects read; duplicate
-  project names are disambiguated with their IDs.
+- Verified grouping properties: `project_id`, `start_date`, `tag_ids`; aggregation
+  `sum(duration)` in seconds. `period` accepts full RFC3339 timestamps, so interval
+  bounds stay timestamp-precise.
+- Running entries contribute 0 seconds (verified live) and planned (calendar) entries
+  are excluded — matching `get_time_entries`, which also skips planned entries (they
+  carry `planned_start` instead of `start`).
+- Tag grouping emits one row per tag id, so group sums can exceed `tracked_seconds` for
+  multi-tag entries; the exact totals come from one extra per-user query (each entry has
+  exactly one owner).
+- Project names resolve via one extra projects read (duplicates disambiguated with IDs);
+  tag names via the tags read; a running timer inside the range is reported through
+  `running_count`.
+- `possibly_truncated` is always false here: aggregation is server-side, so the range
+  endpoint's cap does not apply. Row-cap behavior of the query endpoint is undocumented —
+  pending external verification for very large result sets.
 
-Toggl's dedicated Reports API (`/reports/api/v3/...`) was not reachable under any tested
-host and auth scheme, so summary aggregation is computed from the verified time-entries
-endpoint instead.
+### Planned entries semantics
+
+- The official spec lists a backoffice route (`GET /backoffice/users/{uid}/time-entries`
+  with `view=planned`), but that scope is not served on `focus.toggl.com/api` — it 404s
+  at the proxy level. Planned entries are therefore collected from the same range
+  endpoint as tracked entries, where they appear with `planned_start`/`planned_duration`
+  instead of `start`/`duration`.
+- Narrow windows filter planned entries by `planned_start` (verified live). Entries that
+  also carry tracked time are excluded from `list_planned_entries` and returned by
+  `get_time_entries` instead.
+- The range envelope carries no `total`, so `possibly_truncated` is only set when
+  pagination hits the safety page limit.
+- Verified quirk: requesting `per_page` above 100 makes the range endpoint silently
+  answer with an empty page. The client caps `page_size` at 100, so this cannot be
+  triggered through configuration.
 
 Write tools are exposed only when `TOGGL_ENABLE_WRITE_TOOLS=true`:
 
@@ -45,6 +70,7 @@ Write tools are exposed only when `TOGGL_ENABLE_WRITE_TOOLS=true`:
 - `create_time_entry(description, start, duration_seconds, project_id=None, tags=None, billable=False)`
 - `update_time_entry(entry_id, description=None, project_id=None, tags=None, start=None, duration_seconds=None)`
 - `bulk_edit_time_entries(entry_ids, add_tags=None, remove_tags=None, project_id=None)`
+- `bulk_delete_time_entries(entry_ids)`
 - `delete_time_entry(entry_id)`
 - `create_project(name, active=True, client_id=None, color=None, is_private=True)`
 - `update_project(project_id, name=None, active=None, client_id=None)`
@@ -87,23 +113,47 @@ account:
 
 ### Bulk edit semantics
 
-Toggl's documented bulk PATCH endpoint (`/workspaces/{wid}/time_entries/{ids}`) and the
-canonical `api.track.toggl.com/api/v9` host are **not usable with this server's
-configuration**: the ws-scoped routes return 404 on this base URL, and the canonical host
-rejects `toggl_sk_` credentials (401 Bearer / 403 Basic). `bulk_edit_time_entries`
-therefore applies changes per entry over the verified single-entry routes:
+The Focus API (`focus.toggl.com/api`, the only host that accepts `toggl_sk_` keys) has
+its own OpenAPI spec at engineering.toggl.com, which documents the real bulk surface:
+`PATCH /organizations/{oid}/workspaces/{wid}/time-entries/bulk-edit` with
+`{ids, changes}`. Verified live:
 
-- Tag changes work and are trusted (verified live: add via `tag_ids` merge, remove down
-  to an explicit empty list). Unknown tag names abort the whole call before any entry is
-  touched, so there is never a partial tag set.
-- A project move is re-read and confirmed after the PUT. Verified: the reachable PUT
-  route **silently ignores project changes** (across `project_id`, legacy `pid`,
-  `task_id: null`, `workspace_id`, and stop-inclusive variants), so an ignored move is
-  reported as a per-entry failure — never as success. The likely cause is moving to an
-  inactive project (all projects creatable via this API come back `active=false`, and
-  `active` cannot be flipped to true).
-- Every entry reports its own outcome (`updated` / `error`); one failure never blocks
-  the rest.
+- `changes.project_id` **does** move entries there — project changes must go through
+  PATCH. The single-entry PUT route silently ignores `project_id` (and its variants),
+  which is why updates and bulk edits both use PATCH now.
+- `changes.tag_ids` is tri-state: absent leaves tags untouched, a list sets them, an
+  empty list clears them. Tag names are resolved once up front; unknown names abort
+  before any entry is touched.
+- `update_time_entry` uses the single-entry `PATCH` (partial: absent fields stay
+  unchanged) and re-reads the entry, confirming a project move against fresh state.
+- `bulk_edit_time_entries` reads all requested entries in one batch call
+  (`GET /time-entries/batch?ids=...`), groups them by resulting tag set, issues one
+  bulk-edit call per group, and confirms moves by re-reading. The upstream answers with
+  an empty 204, so outcomes are derived client-side: entries missing from the batch read
+  fail individually, and an unapplied move is reported as a failure — never as success.
+- `GET /users/me/settings` and `GET /organizations/{oid}/users` back the `get_me` and
+  `list_workspace_members` tools.
+
+### Bulk delete semantics
+
+`DELETE /organizations/{oid}/workspaces/{wid}/time-entries/bulk?ids=<csv>` (documented in
+the Focus spec, verified live) answers an empty 204, so `bulk_delete_time_entries`
+derives outcomes client-side:
+
+- A batch read happens first, so unknown or inaccessible IDs fail individually instead
+  of letting one bad ID reject the whole delete request.
+- IDs are deleted in chunks of 100 to stay within URL length limits; one chunk's failure
+  never blocks the others.
+- Every chunk is confirmed by re-reading its IDs: the batch endpoint silently omits IDs
+  that no longer exist, and a 404 on that read means every deletion in the chunk was
+  applied. An entry that upstream still returns after a 204 is reported as failed —
+  never as success. A failed confirmation read is also reported as failed ("delete was
+  accepted but the confirmation read failed"), because claiming success without
+  confirmation is unacceptable for a destructive operation.
+
+The canonical `api.track.toggl.com/api/v9` host rejects `toggl_sk_` credentials (401
+Bearer / 403 Basic); those keys are Focus API tokens and only work against
+`focus.toggl.com/api`.
 
 Project, client, and tag mutations are covered by offline protocol tests but have not
 been exercised against the live account.
@@ -139,8 +189,8 @@ The optional write gate defaults to false:
 TOGGL_ENABLE_WRITE_TOOLS=false
 ```
 
-This is an enforcement boundary, not just an MCP annotation. When false, `start_timer` and
-`stop_timer` are not registered and therefore do not appear in `tools/list`.
+This is an enforcement boundary, not just an MCP annotation. When false, the write tools
+are not registered and therefore do not appear in `tools/list`.
 
 ## Run over stdio
 
@@ -160,7 +210,7 @@ The repository's parent workspace contains a project-scoped Codex configuration 
 server over stdio with the locked uv environment and loads secrets from this project's `.env`.
 The API key is not copied into Codex configuration.
 
-The configuration allowlists exactly the seventeen registered tools. Its `writes` approval
+The configuration allowlists exactly the twenty-three registered tools. Its `writes` approval
 policy allows the read-only tools without a write approval and asks for approval before any
 write tool runs. A drift test (`tests/test_codex_config.py`) fails when `enabled_tools`
 no longer matches the registered tool surface. Run `/mcp` in Codex to inspect the connected

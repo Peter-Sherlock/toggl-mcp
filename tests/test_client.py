@@ -7,7 +7,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from toggl_mcp.client import TogglClient, summarize_entries
+from toggl_mcp.client import TogglClient
 from toggl_mcp.config import TogglConfig
 from toggl_mcp.exceptions import (
     TimerAlreadyRunningError,
@@ -16,7 +16,7 @@ from toggl_mcp.exceptions import (
     TogglRateLimitError,
     TogglRequestValidationError,
 )
-from toggl_mcp.models import BulkEditOutcome, TimeEntry
+from toggl_mcp.models import BulkDeleteOutcome, BulkEditOutcome
 
 ORGANIZATION_ID = 321
 WORKSPACE_ID = 123
@@ -388,6 +388,75 @@ async def test_get_time_entries_allows_equal_start_and_end() -> None:
     assert captured[0].url.params["date_from"] == captured[0].url.params["date_to"]
 
 
+def planned_entry_json(*, entry_id: int = 30) -> dict[str, object]:
+    """Verified real-API shape: planned_start/planned_duration instead of start/duration."""
+
+    return {
+        "id": entry_id,
+        "workspace_id": WORKSPACE_ID,
+        "task_id": None,
+        "project_id": None,
+        "time_block_id": None,
+        "type": "activity",
+        "toggl_user_id": 7663892,
+        "planned_start": "2026-08-18T01:30:00Z",
+        "planned_duration": 3600,
+        "description": "leetcode",
+        "tag_ids": None,
+        "tags": [],
+        "billable": False,
+        "billable_source": "task_default",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_planned_entries_filters_tracked_and_keeps_planned_only() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        page = int(request.url.params["page"])
+        if page == 1:
+            rows = [
+                planned_entry_json(entry_id=30),
+                stopped_entry(entry_id=31),
+                {"id": 32, "workspace_id": WORKSPACE_ID, "type": "activity"},
+            ]
+            return httpx.Response(200, json={"data": rows, "page": 1, "per_page": 3})
+        return httpx.Response(
+            200, json={"data": [planned_entry_json(entry_id=33)], "page": 2, "per_page": 3}
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(page_size=3), transport=transport) as client:
+        result = await client.list_planned_entries(
+            datetime(2026, 8, 15, tzinfo=UTC), datetime(2026, 8, 20, tzinfo=UTC)
+        )
+
+    assert result.count == 2
+    assert result.possibly_truncated is False
+    assert [entry.id for entry in result.entries] == [30, 33]
+    # A row without planned_start cannot validate and is skipped, not fatal.
+    assert result.entries[0].planned_duration == 3600
+    assert result.entries[0].tag_ids == []
+    assert len(captured) == 2
+    assert captured[0].url.params["date_from"] == "2026-08-15T00:00:00.000Z"
+    assert captured[0].url.params["include_taskless"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_list_planned_entries_rejects_naive_dates_before_network_call() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("network should not be called")
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        with pytest.raises(ValueError, match="timezone"):
+            await client.list_planned_entries(datetime(2026, 8, 15), NOW)
+        with pytest.raises(ValueError, match="before or equal"):
+            await client.list_planned_entries(NOW, datetime(2026, 8, 14, tzinfo=UTC))
+
+
 @pytest.mark.asyncio
 async def test_running_flag_uses_one_rule_across_all_read_paths() -> None:
     current_reads = {"n": 0}
@@ -472,15 +541,15 @@ async def test_create_time_entry_posts_expected_body() -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_time_entry_merges_into_full_put_and_rereads() -> None:
+async def test_update_time_entry_patches_changed_fields_only() -> None:
     requests: list[httpx.Request] = []
-    reads = {"n": 0}
+
+    patched = {"done": False}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.method == "GET":
-            reads["n"] += 1
-            description = "Old work" if reads["n"] == 1 else "Renamed work"
+            description = "Renamed work" if patched["done"] else "Old work"
             return httpx.Response(
                 200,
                 json={
@@ -495,23 +564,18 @@ async def test_update_time_entry_merges_into_full_put_and_rereads() -> None:
                     "tag_ids": [7],
                 },
             )
-        assert request.method == "PUT"
-        # The verified upstream PUT answers 204 with an empty body.
+        assert request.method == "PATCH"
+        # The verified upstream PATCH answers 204 with an empty body.
+        patched["done"] = True
         return httpx.Response(204)
 
     transport = httpx.MockTransport(handler)
     async with TogglClient(config(), transport=transport) as client:
         entry = await client.update_time_entry(42, description="Renamed work")
 
-    assert json.loads(requests[1].content) == {
-        "type": "activity",
-        "billable": True,
-        "start": "2026-08-15T09:00:00.000Z",
-        "description": "Renamed work",
-        "duration": 3600,
-        "project_id": 88,
-        "tag_ids": [7],
-    }
+    # PATCH is partial: only the changed field is sent.
+    patch_request = next(r for r in requests if r.method == "PATCH")
+    assert json.loads(patch_request.content) == {"description": "Renamed work"}
     assert entry.description == "Renamed work"
 
 
@@ -529,7 +593,7 @@ async def test_update_time_entry_rejects_duration_change_while_running() -> None
                     "type": "activity",
                 },
             )
-        raise AssertionError("PUT must not happen for a running entry")
+        raise AssertionError("PATCH must not happen for a running entry")
 
     transport = httpx.MockTransport(handler)
     async with TogglClient(config(), transport=transport) as client:
@@ -572,9 +636,9 @@ async def test_tag_names_resolve_to_ids_and_unknown_names_fail() -> None:
         entry = await client.update_time_entry(42, tags=["learning"])
         assert entry.duration == 60
 
-    put_request = next(call for call in calls if call.method == "PUT")
-    put_body = json.loads(put_request.content)
-    assert put_body["tag_ids"] == [7]
+    patch_request = next(call for call in calls if call.method == "PATCH")
+    patch_body = json.loads(patch_request.content)
+    assert patch_body["tag_ids"] == [7]
 
 
 @pytest.mark.asyncio
@@ -724,207 +788,214 @@ async def test_list_tasks_uses_workspace_scoped_project_path() -> None:
     assert requests[0].url.path == WSCOPE + "/projects/88/tasks"
 
 
-def _entry(**overrides: object) -> TimeEntry:
-    fields: dict[str, object] = {
-        "id": 1,
-        "workspace_id": WORKSPACE_ID,
-        "start": datetime(2026, 8, 15, 18, 0, tzinfo=UTC),
-        "duration": 3600,
-    }
-    fields.update(overrides)
-    return TimeEntry(**fields)  # type: ignore[arg-type]
+def _query_handler(
+    requests: list[httpx.Request],
+    *,
+    rows: list[dict[str, object]],
+    projects: list[dict[str, object]] | None = None,
+    tags: list[dict[str, object]] | None = None,
+    user_rows: list[dict[str, object]] | None = None,
+    current: dict[str, object] | None = None,
+) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/query"):
+            body = json.loads(request.content)
+            grouping = body["groupings"][0]["property"]
+            if grouping == "user_account_id":
+                return httpx.Response(200, json={"data_json_row": user_rows or rows})
+            return httpx.Response(200, json={"data_json_row": rows})
+        if request.url.path.endswith("/projects") and projects is not None:
+            return httpx.Response(200, json={"data": projects, "total": len(projects)})
+        if request.url.path.endswith("/tags") and tags is not None:
+            return httpx.Response(200, json=tags)
+        if request.url.path.endswith("/tracking/current"):
+            if current is None:
+                return httpx.Response(204)
+            return httpx.Response(200, json=current)
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
 
-
-def test_summarize_entries_groups_by_project_and_excludes_running() -> None:
-    entries = [
-        _entry(id=1, duration=3600, project_id=1),
-        _entry(id=2, duration=1800, project_id=1),
-        _entry(id=3, duration=None, project_id=2),
-        _entry(id=4, duration=-3600, project_id=2),
-        _entry(id=5, duration=60),
-    ]
-
-    summary = summarize_entries(entries, group_by="project", project_names={1: "Alpha"})
-
-    assert summary.entry_count == 5
-    assert summary.tracked_seconds == 5460
-    assert summary.running_count == 2
-    assert [(g.label, g.seconds, g.entry_count) for g in summary.groups] == [
-        ("Alpha", 5400, 2),
-        ("(no project)", 60, 1),
-    ]
-    assert summary.groups[0].project_id == 1
-    assert summary.groups[1].project_id is None
-
-
-def test_summarize_entries_unknown_projects_fall_back_to_id_labels() -> None:
-    summary = summarize_entries([_entry(duration=120, project_id=77)], group_by="project")
-
-    assert summary.groups[0].label == "project 77"
-    assert summary.groups[0].project_id == 77
-
-
-def test_summarize_entries_by_date_uses_utc_dates_and_descending_seconds() -> None:
-    entries = [
-        _entry(id=1, duration=600, start=datetime(2026, 8, 15, 23, 30, tzinfo=UTC)),
-        _entry(id=2, duration=3600, start=datetime(2026, 8, 14, 22, 0, tzinfo=UTC)),
-    ]
-
-    summary = summarize_entries(entries, group_by="date")
-
-    assert [(g.label, g.seconds) for g in summary.groups] == [
-        ("2026-08-14", 3600),
-        ("2026-08-15", 600),
-    ]
-
-
-def test_summarize_entries_tag_grouping_counts_entry_under_each_tag() -> None:
-    entries = [
-        _entry(id=1, duration=100, tags=[{"name": "a"}, {"name": "b"}]),
-        _entry(id=2, duration=50),
-    ]
-
-    summary = summarize_entries(entries, group_by="tag")
-
-    assert summary.tracked_seconds == 150
-    assert [(g.label, g.seconds) for g in summary.groups] == [
-        ("a", 100),
-        ("b", 100),
-        ("untagged", 50),
-    ]
+    return httpx.MockTransport(handler)
 
 
 @pytest.mark.asyncio
-async def test_summarize_time_resolves_names_and_propagates_truncation() -> None:
+async def test_summarize_time_project_groups_resolve_names() -> None:
     requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.path.endswith("/projects"):
-            return httpx.Response(
-                200,
-                json={
-                    "data": [
-                        {"id": 88, "name": "Agent Learning", "workspace_id": WORKSPACE_ID}
-                    ],
-                    "total": 1,
-                },
-            )
-        assert request.url.path.endswith("/time-entries")
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
-                        "id": 1,
-                        "workspace_id": WORKSPACE_ID,
-                        "project_id": 88,
-                        "description": "work",
-                        "start": "2026-08-15T09:00:00Z",
-                        "duration": 3600,
-                        "type": "activity",
-                    }
-                ],
-                "total": 6,
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
+    transport = _query_handler(
+        requests,
+        rows=[
+            {"count": 3, "project_id": 0, "sum_duration": 18697},
+            {"count": 1, "project_id": 88, "sum_duration": 62},
+        ],
+        projects=[{"id": 88, "name": "Agent Learning", "workspace_id": WORKSPACE_ID}],
+    )
     async with TogglClient(config(), transport=transport) as client:
         summary = await client.summarize_time(
-            datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 8, 31, tzinfo=UTC)
+            datetime(2026, 8, 15, tzinfo=UTC), datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
         )
 
-    assert summary.possibly_truncated is True
-    assert summary.tracked_seconds == 3600
-    assert summary.groups[0].label == "Agent Learning"
-    assert len(requests) == 2  # one range query plus one projects read for names
+    assert summary.tracked_seconds == 18759
+    assert summary.entry_count == 4
+    assert summary.running_count == 0
+    assert summary.possibly_truncated is False
+    assert [(g.label, g.seconds, g.entry_count) for g in summary.groups] == [
+        ("(no project)", 18697, 3),
+        ("Agent Learning", 62, 1),
+    ]
+    assert summary.groups[1].project_id == 88
+    # 查询体应使用 RFC3339 时间戳边界
+    query_body = json.loads(requests[0].content)
+    assert query_body["period"] == {
+        "from": "2026-08-15T00:00:00.000Z",
+        "to": "2026-08-16T12:00:00.000Z",
+    }
+    assert query_body["groupings"] == [{"property": "project_id"}]
 
 
 @pytest.mark.asyncio
 async def test_summarize_time_skips_project_lookup_without_project_ids() -> None:
     requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        assert request.url.path.endswith("/time-entries")
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
-                        "id": 1,
-                        "workspace_id": WORKSPACE_ID,
-                        "description": "work",
-                        "start": "2026-08-15T09:00:00Z",
-                        "duration": 60,
-                        "type": "activity",
-                    }
-                ],
-                "total": 1,
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
+    transport = _query_handler(
+        requests,
+        rows=[{"count": 2, "project_id": 0, "sum_duration": 120}],
+    )
     async with TogglClient(config(), transport=transport) as client:
         summary = await client.summarize_time(
             datetime(2026, 8, 15, tzinfo=UTC), datetime(2026, 8, 16, tzinfo=UTC)
         )
 
-    assert len(requests) == 1
+    # one report query + one running-timer check; no /projects read.
+    paths = [r.url.path for r in requests]
+    assert paths == [
+        f"/api/reports/workspaces/{WORKSPACE_ID}/query",
+        f"/api/organizations/{ORGANIZATION_ID}/workspaces/{WORKSPACE_ID}/tracking/current",
+    ]
     assert summary.groups[0].label == "(no project)"
 
 
 @pytest.mark.asyncio
 async def test_summarize_time_disambiguates_duplicate_project_names() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/projects"):
-            return httpx.Response(
-                200,
-                json={
-                    "data": [
-                        {"id": 1, "name": "Same", "workspace_id": WORKSPACE_ID},
-                        {"id": 2, "name": "Same", "workspace_id": WORKSPACE_ID},
-                    ],
-                    "total": 2,
-                },
-            )
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
-                        "id": 1,
-                        "workspace_id": WORKSPACE_ID,
-                        "project_id": 1,
-                        "description": "work",
-                        "start": "2026-08-15T09:00:00Z",
-                        "duration": 30,
-                        "type": "activity",
-                    },
-                    {
-                        "id": 2,
-                        "workspace_id": WORKSPACE_ID,
-                        "project_id": 2,
-                        "description": "work",
-                        "start": "2026-08-15T09:00:00Z",
-                        "duration": 70,
-                        "type": "activity",
-                    },
-                ],
-                "total": 2,
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
+    requests: list[httpx.Request] = []
+    transport = _query_handler(
+        requests,
+        rows=[
+            {"count": 1, "project_id": 1, "sum_duration": 30},
+            {"count": 1, "project_id": 2, "sum_duration": 70},
+        ],
+        projects=[
+            {"id": 1, "name": "Same", "workspace_id": WORKSPACE_ID},
+            {"id": 2, "name": "Same", "workspace_id": WORKSPACE_ID},
+        ],
+    )
     async with TogglClient(config(), transport=transport) as client:
         summary = await client.summarize_time(
             datetime(2026, 8, 15, tzinfo=UTC), datetime(2026, 8, 16, tzinfo=UTC)
         )
 
-    labels = [group.label for group in summary.groups]
-    assert labels == ["Same (project 2)", "Same (project 1)"]
-    assert [group.project_id for group in summary.groups] == [2, 1]
+    assert [(g.label, g.seconds) for g in summary.groups] == [
+        ("Same (project 2)", 70),
+        ("Same (project 1)", 30),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_date_groups_use_server_buckets() -> None:
+    requests: list[httpx.Request] = []
+    transport = _query_handler(
+        requests,
+        rows=[
+            {"count": 1, "start_date": "2026-08-17", "sum_duration": 16879},
+            {"count": 3, "start_date": "2026-09-02", "sum_duration": 1861},
+        ],
+    )
+    async with TogglClient(config(), transport=transport) as client:
+        summary = await client.summarize_time(
+            datetime(2026, 8, 15, tzinfo=UTC),
+            datetime(2026, 9, 5, tzinfo=UTC),
+            group_by="date",
+        )
+
+    assert [(g.label, g.seconds) for g in summary.groups] == [
+        ("2026-08-17", 16879),
+        ("2026-09-02", 1861),
+    ]
+    query_body = json.loads(requests[0].content)
+    assert query_body["groupings"] == [{"property": "start_date"}]
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_tag_groups_resolve_names_and_exact_totals() -> None:
+    requests: list[httpx.Request] = []
+    transport = _query_handler(
+        requests,
+        rows=[
+            {"count": 1, "tag_ids": [7], "sum_duration": 600},
+            {"count": 2, "tag_ids": [], "sum_duration": 1858},
+        ],
+        tags=[{"id": 7, "name": "learning", "workspace_id": WORKSPACE_ID}],
+        user_rows=[{"count": 3, "user_account_id": 7663892, "sum_duration": 2458}],
+    )
+    async with TogglClient(config(), transport=transport) as client:
+        summary = await client.summarize_time(
+            datetime(2026, 8, 15, tzinfo=UTC),
+            datetime(2026, 9, 5, tzinfo=UTC),
+            group_by="tag",
+        )
+
+    # exact totals come from the ungrouped query (tag rows double-count)
+    assert summary.tracked_seconds == 2458
+    assert summary.entry_count == 3
+    assert [(g.label, g.seconds) for g in summary.groups] == [
+        ("untagged", 1858),
+        ("learning", 600),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_tolerates_empty_result_object() -> None:
+    """Verified: the query endpoint answers `{}` (no data_json_row) when empty."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/query"):
+            # Verified: the real endpoint answers {} when nothing matches.
+            return httpx.Response(200, json={})
+        if request.url.path.endswith("/tracking/current"):
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    transport = httpx.MockTransport(handler)
+
+    async with TogglClient(config(), transport=transport) as client:
+        summary = await client.summarize_time(
+            datetime(2026, 8, 15, tzinfo=UTC), datetime(2026, 8, 16, tzinfo=UTC)
+        )
+
+    assert summary.groups == []
+    assert summary.tracked_seconds == 0
+    assert summary.entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_reports_running_timer_in_range() -> None:
+    requests: list[httpx.Request] = []
+    transport = _query_handler(
+        requests,
+        rows=[{"count": 1, "project_id": 0, "sum_duration": 0}],
+        current={
+            "id": 77,
+            "workspace_id": WORKSPACE_ID,
+            "description": "running",
+            "start": "2026-08-15T10:00:00Z",
+            "type": "activity",
+        },
+    )
+    async with TogglClient(config(), transport=transport) as client:
+        summary = await client.summarize_time(
+            datetime(2026, 8, 15, tzinfo=UTC), datetime(2026, 8, 16, tzinfo=UTC)
+        )
+
+    assert summary.running_count == 1
+    assert summary.tracked_seconds == 0
 
 
 def _entry_json(entry_id: int, *, tag_ids: list[int], project_id: int) -> dict[str, object]:
@@ -941,9 +1012,8 @@ def _entry_json(entry_id: int, *, tag_ids: list[int], project_id: int) -> dict[s
 
 
 @pytest.mark.asyncio
-async def test_bulk_edit_adds_tags_and_moves_projects_per_entry() -> None:
+async def test_bulk_edit_adds_tags_and_moves_projects_via_bulk_endpoint() -> None:
     requests: list[httpx.Request] = []
-    moved: set[int] = set()
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -952,15 +1022,16 @@ async def test_bulk_edit_adds_tags_and_moves_projects_per_entry() -> None:
                 200,
                 json=[{"id": 7, "name": "learn", "workspace_id": WORKSPACE_ID}],
             )
-        entry_id = int(request.url.path.rsplit("/", 1)[-1])
-        if request.method == "GET":
-            existing = [8] if entry_id == 11 else []
-            project = 99 if entry_id in moved else 88
-            body = _entry_json(entry_id, tag_ids=existing, project_id=project)
-            return httpx.Response(200, json=body)
-        assert request.method == "PUT"
-        moved.add(entry_id)
-        return httpx.Response(204)
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            requested = request.url.params["ids"]
+            entries = [
+                _entry_json(int(raw_id), tag_ids=[], project_id=99)
+                for raw_id in requested.split(",")
+            ]
+            return httpx.Response(200, json=entries)
+        if request.method == "PATCH" and request.url.path.endswith("/bulk-edit"):
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
 
     transport = httpx.MockTransport(handler)
     async with TogglClient(config(), transport=transport) as client:
@@ -972,35 +1043,62 @@ async def test_bulk_edit_adds_tags_and_moves_projects_per_entry() -> None:
         BulkEditOutcome(entry_id=11, updated=True, error=None),
         BulkEditOutcome(entry_id=12, updated=True, error=None),
     ]
-    put_bodies = [json.loads(r.content) for r in requests if r.method == "PUT"]
-    # entry 11 keeps its pre-existing tag 8 and gains 7; entry 12 gains 7.
-    assert put_bodies[0]["tag_ids"] == [8, 7]
-    assert put_bodies[1]["tag_ids"] == [7]
-    assert all(body["project_id"] == 99 for body in put_bodies)
+    # One batch read, then ONE grouped bulk-edit call (both entries share the
+    # same resulting tag set).
+    bulk_calls = [
+        json.loads(r.content) for r in requests if str(r.url.path).endswith("/bulk-edit")
+    ]
+    assert len(bulk_calls) == 1
+    assert bulk_calls[0] == {
+        "ids": [11, 12],
+        "changes": {"project_id": 99, "tag_ids": [7]},
+    }
 
 
 @pytest.mark.asyncio
-async def test_bulk_edit_reports_silently_ignored_project_moves() -> None:
+async def test_bulk_edit_groups_entries_by_resulting_tag_set() -> None:
     requests: list[httpx.Request] = []
+
+    moved = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        entry_id = int(request.url.path.rsplit("/", 1)[-1])
-        if request.method == "GET":
-            # Upstream always reports the OLD project: the move is silently ignored.
-            return httpx.Response(200, json=_entry_json(entry_id, tag_ids=[], project_id=88))
-        return httpx.Response(204)
+        if request.url.path.endswith("/tags"):
+            return httpx.Response(
+                200,
+                json=[{"id": 7, "name": "learn", "workspace_id": WORKSPACE_ID}],
+            )
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            project = 99 if moved["n"] else 88
+            entries = [
+                _entry_json(11, tag_ids=[8], project_id=project),
+                _entry_json(12, tag_ids=[], project_id=project),
+            ]
+            return httpx.Response(200, json=entries)
+        if request.method == "PATCH" and request.url.path.endswith("/bulk-edit"):
+            moved["n"] += 1
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
 
     transport = httpx.MockTransport(handler)
     async with TogglClient(config(), transport=transport) as client:
-        outcomes = await client.bulk_edit_time_entries([11, 12], project_id=99)
+        outcomes = await client.bulk_edit_time_entries(
+            [11, 12], add_tags=["learn"], project_id=99
+        )
 
-    assert all(outcome.updated is False for outcome in outcomes)
-    assert all("was not applied" in (outcome.error or "") for outcome in outcomes)
+    bulk_calls = [
+        json.loads(r.content) for r in requests if str(r.url.path).endswith("/bulk-edit")
+    ]
+    # Entry 11 keeps tag 8 and gains 7; entry 12 only gains 7 → two distinct groups.
+    assert len(bulk_calls) == 2
+    by_ids = {tuple(call["ids"]): call["changes"]["tag_ids"] for call in bulk_calls}
+    assert by_ids == {(11,): [8, 7], (12,): [7]}
+    assert [o.entry_id for o in outcomes] == [11, 12]
+    assert all(o.updated for o in outcomes)
 
 
 @pytest.mark.asyncio
-async def test_bulk_edit_removes_tags_down_to_empty() -> None:
+async def test_bulk_edit_removes_tags_down_to_explicit_empty() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1010,8 +1108,9 @@ async def test_bulk_edit_removes_tags_down_to_empty() -> None:
                 200,
                 json=[{"id": 7, "name": "learn", "workspace_id": WORKSPACE_ID}],
             )
-        if request.method == "GET":
-            return httpx.Response(200, json=_entry_json(11, tag_ids=[7], project_id=88))
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            return httpx.Response(200, json=[_entry_json(11, tag_ids=[7], project_id=88)])
+        assert request.method == "PATCH" and request.url.path.endswith("/bulk-edit")
         return httpx.Response(204)
 
     transport = httpx.MockTransport(handler)
@@ -1019,26 +1118,22 @@ async def test_bulk_edit_removes_tags_down_to_empty() -> None:
         outcomes = await client.bulk_edit_time_entries([11], remove_tags=["learn"])
 
     assert outcomes[0].updated is True
-    put_body = json.loads(requests[-1].content)
-    # Explicit empty list is the only verified way to clear tags upstream.
-    assert put_body["tag_ids"] == []
+    bulk_call = json.loads(requests[-1].content)
+    # Explicit empty list is the tri-state way to clear tags upstream.
+    assert bulk_call["changes"] == {"tag_ids": []}
 
 
 @pytest.mark.asyncio
-async def test_bulk_edit_reports_per_entry_failures_without_blocking() -> None:
+async def test_bulk_edit_reports_missing_entries_and_ignored_moves() -> None:
     requests: list[httpx.Request] = []
-
-    moved: set[int] = set()
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        entry_id = int(request.url.path.rsplit("/", 1)[-1])
-        if request.method == "GET":
-            if entry_id == 99:
-                return httpx.Response(404, json={"error": "gone"})
-            project = 99 if entry_id in moved else 88
-            return httpx.Response(200, json=_entry_json(entry_id, tag_ids=[], project_id=project))
-        moved.add(entry_id)
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            # Entry 99 is missing (not found/inaccessible); the other keeps the OLD
+            # project after the edit: the move is silently ignored upstream.
+            return httpx.Response(200, json=[_entry_json(11, tag_ids=[], project_id=88)])
+        assert request.method == "PATCH" and request.url.path.endswith("/bulk-edit")
         return httpx.Response(204)
 
     transport = httpx.MockTransport(handler)
@@ -1046,22 +1141,31 @@ async def test_bulk_edit_reports_per_entry_failures_without_blocking() -> None:
         outcomes = await client.bulk_edit_time_entries([99, 11], project_id=99)
 
     assert outcomes[0].updated is False
-    assert outcomes[0].error is not None
-    assert outcomes[1].updated is True
+    assert "not found or not accessible" in (outcomes[0].error or "")
+    assert outcomes[1].updated is False
+    assert "was not applied" in (outcomes[1].error or "")
 
 
 @pytest.mark.asyncio
-async def test_update_time_entry_raises_when_move_is_silently_ignored() -> None:
+async def test_bulk_edit_surfaces_upstream_bulk_failures() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            # Always the old project: the move is silently ignored upstream.
-            return httpx.Response(200, json=_entry_json(42, tag_ids=[], project_id=88))
-        return httpx.Response(204)
+        if request.url.path.endswith("/tags"):
+            return httpx.Response(
+                200,
+                json=[{"id": 7, "name": "learn", "workspace_id": WORKSPACE_ID}],
+            )
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            return httpx.Response(200, json=[_entry_json(11, tag_ids=[], project_id=88)])
+        assert request.method == "PATCH" and request.url.path.endswith("/bulk-edit")
+        return httpx.Response(429, json={"error": "rate limited"})
 
     transport = httpx.MockTransport(handler)
     async with TogglClient(config(), transport=transport) as client:
-        with pytest.raises(ValueError, match="did not apply"):
-            await client.update_time_entry(42, project_id=99)
+        outcomes = await client.bulk_edit_time_entries([11], add_tags=["learn"])
+
+    assert outcomes == [
+        BulkEditOutcome(entry_id=11, updated=False, error="Toggl request rate limit was exceeded.")
+    ]
 
 
 @pytest.mark.asyncio
@@ -1084,3 +1188,210 @@ async def test_bulk_edit_validates_before_touching_any_entry() -> None:
             await client.bulk_edit_time_entries([11], add_tags=["learn"], remove_tags=["learn"])
         with pytest.raises(ValueError, match="Unknown tag"):
             await client.bulk_edit_time_entries([11], add_tags=["nonexistent"])
+
+
+def _bulk_delete_handler(
+    requests: list[httpx.Request],
+    store: set[int],
+    *,
+    apply_deletion: bool = True,
+) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            requested = [int(raw_id) for raw_id in request.url.params["ids"].split(",")]
+            return httpx.Response(
+                200,
+                json=[
+                    _entry_json(entry_id, tag_ids=[], project_id=88)
+                    for entry_id in requested
+                    if entry_id in store
+                ],
+            )
+        assert request.method == "DELETE"
+        assert request.url.path.endswith("/time-entries/bulk")
+        if apply_deletion:
+            store.difference_update(
+                int(raw_id) for raw_id in request.url.params["ids"].split(",")
+            )
+        return httpx.Response(204)
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_confirms_deletions_and_reports_unknown_ids() -> None:
+    requests: list[httpx.Request] = []
+    store = {11, 12, 13}
+    transport = _bulk_delete_handler(requests, store)
+
+    async with TogglClient(config(), transport=transport) as client:
+        outcomes = await client.bulk_delete_time_entries([11, 99, 12])
+
+    # 99 is unknown and fails individually; 11 and 12 are confirmed deleted.
+    assert outcomes == [
+        BulkDeleteOutcome(entry_id=11, deleted=True, error=None),
+        BulkDeleteOutcome(
+            entry_id=99,
+            deleted=False,
+            error="Entry not found or not accessible in this workspace.",
+        ),
+        BulkDeleteOutcome(entry_id=12, deleted=True, error=None),
+    ]
+    delete_calls = [r for r in requests if r.method == "DELETE"]
+    assert [r.url.params["ids"] for r in delete_calls] == ["11,12"]
+    assert store == {13}
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_chunks_ids_across_requests() -> None:
+    requests: list[httpx.Request] = []
+    store = set(range(1, 102))  # 101 IDs: one full chunk plus one remainder.
+    transport = _bulk_delete_handler(requests, store)
+
+    async with TogglClient(config(), transport=transport) as client:
+        outcomes = await client.bulk_delete_time_entries(sorted(store))
+
+    delete_calls = [r for r in requests if r.method == "DELETE"]
+    assert len(delete_calls) == 2
+    assert delete_calls[0].url.params["ids"] == ",".join(str(i) for i in range(1, 101))
+    assert delete_calls[1].url.params["ids"] == "101"
+    assert all(outcome.deleted for outcome in outcomes)
+    assert store == set()
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_reports_unconfirmed_deletion_when_read_fails() -> None:
+    requests: list[httpx.Request] = []
+    reads = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                # Pre-read sees the entry; the confirmation read after the delete fails.
+                return httpx.Response(200, json=[_entry_json(11, tag_ids=[], project_id=88)])
+            return httpx.Response(500, json={"error": "server error"})
+        assert request.method == "DELETE"
+        return httpx.Response(204)
+
+    async with TogglClient(config(), transport=httpx.MockTransport(handler)) as client:
+        outcomes = await client.bulk_delete_time_entries([11])
+
+    assert outcomes[0].deleted is False
+    message = outcomes[0].error or ""
+    assert "Delete was accepted" in message
+    assert "confirmation read failed" in message
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_reports_entries_upstream_kept() -> None:
+    requests: list[httpx.Request] = []
+    store = {11}
+    transport = _bulk_delete_handler(requests, store, apply_deletion=False)
+
+    async with TogglClient(config(), transport=transport) as client:
+        outcomes = await client.bulk_delete_time_entries([11])
+
+    assert outcomes[0].deleted is False
+    assert "still exists" in (outcomes[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_surfaces_rejected_delete_calls() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            return httpx.Response(200, json=[_entry_json(11, tag_ids=[], project_id=88)])
+        assert request.method == "DELETE"
+        return httpx.Response(429, json={"error": "rate limited"})
+
+    async with TogglClient(config(), transport=httpx.MockTransport(handler)) as client:
+        outcomes = await client.bulk_delete_time_entries([11])
+
+    assert outcomes == [
+        BulkDeleteOutcome(
+            entry_id=11,
+            deleted=False,
+            error="Toggl request rate limit was exceeded.",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_validates_before_touching_any_entry() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should happen for invalid input")
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        with pytest.raises(ValueError, match="empty"):
+            await client.bulk_delete_time_entries([])
+        with pytest.raises(ValueError, match="positive integers"):
+            await client.bulk_delete_time_entries([11, 0])
+
+
+@pytest.mark.asyncio
+async def test_get_me_settings_returns_orienting_fields() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/users/me/settings"
+        return httpx.Response(
+            200,
+            json={
+                "current_workspace_id": WORKSPACE_ID,
+                "date_format": "MM/DD/YYYY",
+                "duration_format": "improved",
+                "timeofday_format": "H:mm",
+                "timezone": "Asia/Shanghai",
+                "focus_mode_count_up": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        settings = await client.get_me_settings()
+
+    assert settings.current_workspace_id == WORKSPACE_ID
+    assert settings.duration_format == "improved"
+    assert settings.timezone == "Asia/Shanghai"
+
+
+@pytest.mark.asyncio
+async def test_list_workspace_members_flattens_workspace_membership() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/api/organizations/{ORGANIZATION_ID}/users"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 1,
+                    "name": "Peter",
+                    "email": "peter@example.com",
+                    "owner": True,
+                    "is_admin": True,
+                    "active": True,
+                    "joined": True,
+                    "workspaces": [{"id": WORKSPACE_ID, "name": "Main"}],
+                },
+                {
+                    "id": 2,
+                    "name": "Invitee",
+                    "owner": False,
+                    "is_admin": False,
+                    "active": False,
+                    "joined": False,
+                    "workspaces": [],
+                },
+            ],
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        members = await client.list_workspace_members()
+
+    assert members[0].workspace_ids == [WORKSPACE_ID]
+    assert members[0].owner is True and members[0].admin is True
+    assert members[1].joined is False and members[1].workspace_ids == []

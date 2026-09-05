@@ -65,10 +65,13 @@ READ_TOOL_NAMES = [
     "get_current_timer",
     "get_time_entries",
     "get_time_entry",
+    "list_planned_entries",
     "list_clients",
     "list_tags",
     "list_tasks",
     "summarize_time",
+    "get_me",
+    "list_workspace_members",
 ]
 WRITE_TOOL_NAMES = [
     "start_timer",
@@ -76,6 +79,7 @@ WRITE_TOOL_NAMES = [
     "create_time_entry",
     "update_time_entry",
     "bulk_edit_time_entries",
+    "bulk_delete_time_entries",
     "delete_time_entry",
     "create_project",
     "update_project",
@@ -313,7 +317,7 @@ async def test_time_entry_lifecycle_through_protocol() -> None:
                     "type": "activity",
                 },
             )
-        if request.method == "PUT":
+        if request.method == "PATCH":
             return httpx.Response(204)
         if request.method == "DELETE":
             return httpx.Response(200, text="OK")
@@ -364,9 +368,9 @@ async def test_time_entry_lifecycle_through_protocol() -> None:
     assert deleted.is_error is False
     assert deleted.structured_content is not None
     assert deleted.structured_content == {"deleted": True, "entity_id": 42}
-    # update = read current state, PUT merged body, read back.
+    # update = duration change reads current state first, then PATCH, then re-read.
     assert [request.method for request in requests] == [
-        "POST", "GET", "PUT", "GET", "DELETE",
+        "POST", "GET", "PATCH", "GET", "DELETE",
     ]
 
 
@@ -411,8 +415,131 @@ async def test_workspace_list_tools_return_structured_results() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_planned_entries_returns_structured_results() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        assert request.url.path.endswith("/time-entries")
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    stopped_entry(),
+                    {
+                        "id": 30,
+                        "workspace_id": WORKSPACE_ID,
+                        "task_id": None,
+                        "project_id": None,
+                        "type": "activity",
+                        "planned_start": "2026-08-18T01:30:00Z",
+                        "planned_duration": 3600,
+                        "description": "leetcode",
+                        "tag_ids": None,
+                        "tags": [],
+                        "billable": False,
+                    },
+                ],
+                "page": 1,
+                "per_page": 100,
+            },
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=False,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "list_planned_entries",
+            {
+                "start_date": "2026-08-15T00:00:00+00:00",
+                "end_date": "2026-08-20T00:00:00+00:00",
+            },
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["count"] == 1
+    assert result.structured_content["possibly_truncated"] is False
+    planned = result.structured_content["entries"][0]
+    assert planned["id"] == 30
+    assert planned["description"] == "leetcode"
+    assert planned["project_id"] is None
+    assert planned["planned_duration_seconds"] == 3600
+    assert planned["entry_type"] == "activity"
+    assert planned["planned_start"].startswith("2026-08-18T01:30:00")
+    assert captured[0].url.params["date_from"] == "2026-08-15T00:00:00.000Z"
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_time_entries_returns_per_entry_outcomes() -> None:
+    requests: list[httpx.Request] = []
+    reads = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path.endswith("/batch"):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                # Pre-read: both entries exist.
+                return httpx.Response(
+                    200,
+                    json=[stopped_entry(entry_id=11), stopped_entry(entry_id=12)],
+                )
+            # Confirmation read: only 12 still exists.
+            return httpx.Response(200, json=[stopped_entry(entry_id=12)])
+        assert request.method == "DELETE"
+        assert request.url.path.endswith("/time-entries/bulk")
+        assert request.url.params["ids"] == "11,12"
+        return httpx.Response(204)
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=True,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "bulk_delete_time_entries",
+            {"entry_ids": [11, 12]},
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["deleted_count"] == 1
+    assert result.structured_content["failed_count"] == 1
+    outcomes = result.structured_content["outcomes"]
+    assert outcomes[0] == {
+        "entry_id": 11,
+        "deleted": True,
+        "error": None,
+    }
+    assert outcomes[1]["deleted"] is False
+    assert "still exists" in (outcomes[1]["error"] or "")
+    assert [request.method for request in requests] == ["GET", "DELETE", "GET"]
+
+
+@pytest.mark.asyncio
 async def test_summarize_time_returns_structured_groups() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/query"):
+            body = json.loads(request.content)
+            if "groupings" not in body:
+                ungrouped = {"data_json_row": [{"count": 2, "sum_duration": 3600}]}
+                return httpx.Response(200, json=ungrouped)
+            return httpx.Response(
+                200,
+                json={
+                    "data_json_row": [
+                        {"count": 1, "project_id": 88, "sum_duration": 3600},
+                        {"count": 1, "project_id": 0, "sum_duration": 0},
+                    ]
+                },
+            )
         if request.url.path.endswith("/projects"):
             return httpx.Response(
                 200,
@@ -423,32 +550,9 @@ async def test_summarize_time_returns_structured_groups() -> None:
                     "total": 1,
                 },
             )
-        assert request.url.path.endswith("/time-entries")
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
-                        "id": 1,
-                        "workspace_id": WORKSPACE_ID,
-                        "project_id": 88,
-                        "description": "work",
-                        "start": "2026-08-15T09:00:00Z",
-                        "duration": 3600,
-                        "type": "activity",
-                    },
-                    {
-                        "id": 2,
-                        "workspace_id": WORKSPACE_ID,
-                        "project_id": 88,
-                        "description": "running work",
-                        "start": "2026-08-15T10:00:00Z",
-                        "type": "activity",
-                    },
-                ],
-                "total": 2,
-            },
-        )
+        if request.url.path.endswith("/tracking/current"):
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
     server = create_server(
         config_loader=config,
@@ -469,7 +573,7 @@ async def test_summarize_time_returns_structured_groups() -> None:
     assert result.is_error is False
     assert result.structured_content is not None
     assert result.structured_content["tracked_seconds"] == 3600
-    assert result.structured_content["running_count"] == 1
+    assert result.structured_content["running_count"] == 0
     assert result.structured_content["entry_count"] == 2
     assert result.structured_content["possibly_truncated"] is False
     assert result.structured_content["groups"] == [
@@ -478,5 +582,6 @@ async def test_summarize_time_returns_structured_groups() -> None:
             "seconds": 3600,
             "entry_count": 1,
             "project_id": 88,
-        }
+        },
+        {"label": "(no project)", "seconds": 0, "entry_count": 1, "project_id": None},
     ]

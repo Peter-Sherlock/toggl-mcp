@@ -112,6 +112,47 @@ class TimeEntriesResult(BaseModel):
     possibly_truncated: bool
 
 
+class PlannedTimeEntry(BaseModel):
+    """Planned (calendar-scheduled) entry, which does not carry tracked time yet.
+
+    Verified against the real API: planned entries arrive from the same range endpoint
+    as tracked entries but carry `planned_start`/`planned_duration` instead of
+    `start`/`duration`, and report `null` for missing tag lists.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: int
+    workspace_id: int
+    project_id: int | None = None
+    task_id: int | None = None
+    description: str | None = None
+    planned_start: datetime
+    planned_duration: int | None = None
+    entry_type: str = Field(default="activity", validation_alias="type")
+    tag_ids: list[int] = Field(default_factory=list)
+    billable: bool = False
+
+    @field_validator("tag_ids", mode="before")
+    @classmethod
+    def normalize_null_lists(cls, value: object) -> object:
+        """The API documents `null` for missing tag lists; callers receive stable lists."""
+
+        if value is None:
+            return []
+        return value
+
+
+class PlannedEntriesResult(BaseModel):
+    """Range-query result for planned entries, with the same truncation signal."""
+
+    model_config = ConfigDict(frozen=True)
+
+    entries: list[PlannedTimeEntry]
+    count: int
+    possibly_truncated: bool
+
+
 class SummaryGroup(BaseModel):
     """One aggregation bucket of a time summary."""
 
@@ -131,6 +172,58 @@ class BulkEditOutcome(BaseModel):
     entry_id: int
     updated: bool
     error: str | None = None
+
+
+class BulkDeleteOutcome(BaseModel):
+    """Per-entry result of a bulk delete; one failure never blocks the others."""
+
+    model_config = ConfigDict(frozen=True)
+
+    entry_id: int
+    deleted: bool
+    error: str | None = None
+
+
+class UserSettings(BaseModel):
+    """The authenticated user's Focus settings; unrelated UI preferences are ignored."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    current_workspace_id: int | None = None
+    date_format: str | None = None
+    duration_format: str | None = None
+    timeofday_format: str | None = None
+    timezone: str | None = None
+
+
+class WorkspaceMember(BaseModel):
+    """One member of the organization, with the workspaces they belong to."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: int
+    name: str
+    email: str | None = None
+    owner: bool = False
+    admin: bool = Field(default=False, validation_alias="is_admin")
+    active: bool = True
+    joined: bool = False
+    workspace_ids: list[int] = Field(
+        default_factory=list, validation_alias="workspaces"
+    )
+
+    @field_validator("workspace_ids", mode="before")
+    @classmethod
+    def extract_workspace_ids(cls, value: object) -> object:
+        """The API returns workspace membership as objects; keep only their IDs."""
+
+        if isinstance(value, list):
+            return [
+                item.get("id")
+                for item in value
+                if isinstance(item, dict) and isinstance(item.get("id"), int)
+            ]
+        return value
 
 
 class TimeSummary(BaseModel):

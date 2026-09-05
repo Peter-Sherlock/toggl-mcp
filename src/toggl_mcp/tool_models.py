@@ -6,7 +6,16 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from toggl_mcp.models import Client, Project, Tag, Task, TimeEntry
+from toggl_mcp.models import (
+    Client,
+    PlannedTimeEntry,
+    Project,
+    Tag,
+    Task,
+    TimeEntry,
+    UserSettings,
+    WorkspaceMember,
+)
 
 
 class ToolOutput(BaseModel):
@@ -89,6 +98,47 @@ class TimeEntriesOutput(ToolOutput):
         )
     )
     entries: list[TimeEntrySummary]
+
+
+class PlannedEntrySummary(ToolOutput):
+    """Stable subset of a planned (calendar-scheduled) Toggl entry."""
+
+    id: int = Field(description="Toggl time-entry ID of the planned entry.")
+    description: str | None = Field(description="What is planned.")
+    project_id: int | None = Field(description="Associated project ID, if any.")
+    task_id: int | None = Field(description="Associated task ID, if any.")
+    planned_start: datetime = Field(description="Planned start timestamp (timezone-aware).")
+    planned_duration_seconds: int | None = Field(
+        description="Planned duration in seconds, when the plan carries one."
+    )
+    entry_type: str = Field(description="Toggl entry type, normally activity.")
+
+    @classmethod
+    def from_planned_entry(cls, entry: PlannedTimeEntry) -> PlannedEntrySummary:
+        return cls(
+            id=entry.id,
+            description=entry.description,
+            project_id=entry.project_id,
+            task_id=entry.task_id,
+            planned_start=entry.planned_start,
+            planned_duration_seconds=entry.planned_duration,
+            entry_type=entry.entry_type,
+        )
+
+
+class ListPlannedEntriesOutput(ToolOutput):
+    """Planned (calendar) entries whose planned_start falls in the requested interval."""
+
+    start_date: datetime
+    end_date: datetime
+    count: int = Field(description="Number of planned entries returned after pagination.")
+    possibly_truncated: bool = Field(
+        description=(
+            "True when pagination hit its safety page limit and the interval may contain "
+            "more planned entries than were returned."
+        )
+    )
+    entries: list[PlannedEntrySummary]
 
 
 class StartTimerOutput(ToolOutput):
@@ -220,6 +270,84 @@ class BulkEditTimeEntriesOutput(ToolOutput):
     updated_count: int = Field(description="Number of entries successfully edited.")
     failed_count: int = Field(description="Number of entries whose edit failed.")
     outcomes: list[BulkEditOutcomeSummary]
+
+
+class BulkDeleteOutcomeSummary(ToolOutput):
+    """Per-entry result of a bulk delete."""
+
+    entry_id: int = Field(description="Time-entry ID this outcome belongs to.")
+    deleted: bool = Field(description="Whether this entry was confirmed deleted upstream.")
+    error: str | None = Field(
+        description="Stable failure reason for this entry; null when deleted is true."
+    )
+
+
+class BulkDeleteTimeEntriesOutput(ToolOutput):
+    """Aggregated per-entry outcomes of one bulk delete."""
+
+    deleted_count: int = Field(description="Number of entries confirmed deleted.")
+    failed_count: int = Field(description="Number of entries whose deletion failed.")
+    outcomes: list[BulkDeleteOutcomeSummary]
+
+
+class MeSettingsOutput(ToolOutput):
+    """The authenticated user's Focus settings relevant to agents."""
+
+    current_workspace_id: int | None = Field(
+        description=(
+            "Workspace the user currently has selected in Toggl; compare against this "
+            "server's configured workspace to notice a mismatch."
+        )
+    )
+    date_format: str | None = Field(description="User's date format preference.")
+    duration_format: str | None = Field(description="User's duration format preference.")
+    timeofday_format: str | None = Field(description="User's time-of-day format preference.")
+    timezone: str | None = Field(description="User's timezone setting.")
+
+    @classmethod
+    def from_settings(cls, settings: UserSettings) -> MeSettingsOutput:
+        return cls(
+            current_workspace_id=settings.current_workspace_id,
+            date_format=settings.date_format,
+            duration_format=settings.duration_format,
+            timeofday_format=settings.timeofday_format,
+            timezone=settings.timezone,
+        )
+
+
+class MemberSummary(ToolOutput):
+    """One organization member, reduced to what an agent needs."""
+
+    id: int = Field(description="Organization user ID.")
+    name: str = Field(description="Member's display name.")
+    email: str | None = Field(description="Member's email address.")
+    owner: bool = Field(description="Whether the member owns the organization.")
+    admin: bool = Field(description="Whether the member is an organization admin.")
+    active: bool = Field(description="Whether the membership is active.")
+    joined: bool = Field(description="Whether the member has accepted their invite.")
+    workspace_ids: list[int] = Field(
+        description="IDs of the workspaces the member belongs to."
+    )
+
+    @classmethod
+    def from_member(cls, member: WorkspaceMember) -> MemberSummary:
+        return cls(
+            id=member.id,
+            name=member.name,
+            email=member.email,
+            owner=member.owner,
+            admin=member.admin,
+            active=member.active,
+            joined=member.joined,
+            workspace_ids=member.workspace_ids,
+        )
+
+
+class ListWorkspaceMembersOutput(ToolOutput):
+    """Result of listing the organization's members."""
+
+    count: int = Field(description="Number of members returned.")
+    members: list[MemberSummary]
 
 
 class SummaryGroupOutput(ToolOutput):

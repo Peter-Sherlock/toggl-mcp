@@ -26,8 +26,11 @@ from toggl_mcp.exceptions import (
     TogglServerError,
 )
 from toggl_mcp.models import (
+    BulkDeleteOutcome,
     BulkEditOutcome,
     Client,
+    PlannedEntriesResult,
+    PlannedTimeEntry,
     Project,
     SummaryGroup,
     Tag,
@@ -35,6 +38,8 @@ from toggl_mcp.models import (
     TimeEntriesResult,
     TimeEntry,
     TimeSummary,
+    UserSettings,
+    WorkspaceMember,
 )
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -47,72 +52,9 @@ SummaryGrouping = Literal["project", "date", "tag"]
 # far more entries than Toggl's documented 1000-entry range cap.
 MAX_PAGES = 100
 
-
-def summarize_entries(
-    entries: Sequence[TimeEntry],
-    *,
-    group_by: SummaryGrouping,
-    project_names: Mapping[int, str] | None = None,
-    possibly_truncated: bool = False,
-) -> TimeSummary:
-    """Aggregate validated entries; the single source of summary semantics.
-
-    Running entries (null or negative duration) are counted but excluded from all sums
-    because their durations are not final. Tag grouping attributes one entry's full
-    duration to each of its tags, so group sums can exceed `tracked_seconds`. Dates are
-    the UTC calendar dates of entry starts.
-    """
-
-    names = project_names or {}
-    totals: dict[str, list[int]] = {}
-    group_project: dict[str, int | None] = {}
-
-    def record(label: str, seconds: int, project_id: int | None) -> None:
-        bucket = totals.setdefault(label, [0, 0])
-        bucket[0] += seconds
-        bucket[1] += 1
-        group_project.setdefault(label, project_id)
-
-    tracked_seconds = 0
-    running_count = 0
-    for entry in entries:
-        if entry.duration is None or entry.duration < 0:
-            running_count += 1
-            continue
-        tracked_seconds += entry.duration
-        if group_by == "project":
-            project_id = entry.project_id
-            if project_id is None:
-                record("(no project)", entry.duration, None)
-            else:
-                record(names.get(project_id, f"project {project_id}"), entry.duration, project_id)
-        elif group_by == "date":
-            start = entry.start if entry.start.tzinfo is None else entry.start.astimezone(UTC)
-            record(start.date().isoformat(), entry.duration, None)
-        else:
-            if entry.tags:
-                for tag in entry.tags:
-                    record(tag.name, entry.duration, None)
-            else:
-                record("untagged", entry.duration, None)
-
-    ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
-    groups = [
-        SummaryGroup(
-            label=label,
-            seconds=bucket[0],
-            entry_count=bucket[1],
-            project_id=group_project.get(label),
-        )
-        for label, bucket in ordered
-    ]
-    return TimeSummary(
-        entry_count=len(entries),
-        tracked_seconds=tracked_seconds,
-        running_count=running_count,
-        possibly_truncated=possibly_truncated,
-        groups=groups,
-    )
+# IDs travel in the bulk endpoints' query string, so large batches are chunked to stay
+# within URL length limits.
+BULK_CHUNK = 100
 
 
 def _utc_now() -> datetime:
@@ -254,7 +196,16 @@ class TogglClient:
             )
             raw_entries, page_total = self._extract_page(payload, endpoint="time-entries")
             total = page_total if page_total is not None else total
-            entries.extend(self._validate(TimeEntry, item) for item in raw_entries)
+            # The range endpoint also returns planned entries (calendar plans), which
+            # carry `planned_start` instead of `start`. They are not tracked time and
+            # cannot validate against the entry schema, so they are skipped here; the
+            # pagination math keeps counting them because they consume page slots.
+            tracked = [
+                item
+                for item in raw_entries
+                if isinstance(item, dict) and item.get("start") is not None
+            ]
+            entries.extend(self._validate(TimeEntry, item) for item in tracked)
             if len(raw_entries) < self._config.page_size or (
                 total is not None and len(entries) >= total
             ):
@@ -272,6 +223,64 @@ class TogglClient:
             ),
         )
 
+    async def list_planned_entries(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> PlannedEntriesResult:
+        """Return planned (calendar) entries whose planned_start is within an aware range.
+
+        Verified against the Focus API: there is no dedicated planned-entries route
+        reachable with a workspace token (the documented backoffice route 404s here), so
+        planned entries are collected from the same range endpoint as tracked entries.
+        Narrow windows filter them by `planned_start`. Entries that also carry tracked
+        time (`start`) are excluded — they belong to `get_time_entries`. The range
+        envelope reports no total, so `possibly_truncated` is only set when pagination
+        hits the safety page limit.
+        """
+
+        self._require_aware_datetime(start_date, name="start_date")
+        self._require_aware_datetime(end_date, name="end_date")
+        if start_date > end_date:
+            raise ValueError("start_date must be before or equal to end_date")
+
+        entries: list[PlannedTimeEntry] = []
+        page_number = 1
+        hit_page_guard = False
+        while True:
+            payload = await self._request_json(
+                "GET",
+                f"{self._scope}/time-entries",
+                params={
+                    "date_from": self._format_rfc3339(start_date),
+                    "date_to": self._format_rfc3339(end_date),
+                    "page": page_number,
+                    "per_page": self._config.page_size,
+                    "include_taskless": "true",
+                },
+            )
+            raw_entries, _total = self._extract_page(payload, endpoint="time-entries")
+            planned = [
+                item
+                for item in raw_entries
+                if isinstance(item, dict)
+                and item.get("start") is None
+                and item.get("planned_start") is not None
+            ]
+            entries.extend(self._validate(PlannedTimeEntry, item) for item in planned)
+            if len(raw_entries) < self._config.page_size:
+                break
+            if page_number >= MAX_PAGES:
+                hit_page_guard = True
+                break
+            page_number += 1
+
+        return PlannedEntriesResult(
+            entries=entries,
+            count=len(entries),
+            possibly_truncated=hit_page_guard,
+        )
+
     async def summarize_time(
         self,
         start_date: datetime,
@@ -279,22 +288,103 @@ class TogglClient:
         *,
         group_by: SummaryGrouping = "project",
     ) -> TimeSummary:
-        """Aggregate tracked time over an aware range without counting running work.
+        """Aggregate tracked time over an aware range via Toggl's native report engine.
 
-        Project grouping resolves entry project IDs to names via one extra projects read
-        and disambiguates duplicate project names with their IDs. The truncation signal
-        of the underlying range query is propagated so callers can treat totals as
-        lower bounds.
+        Verified against the Focus API: `POST /reports/workspaces/{wid}/query` groups by
+        `project_id`, `start_date`, or `tag_ids` and answers `sum(duration)` in seconds.
+        Running entries contribute 0 seconds, planned (calendar) entries are excluded,
+        and one tag-grouped row appears per tag id, so tag group sums can exceed the
+        total for multi-tag entries — the exact entry total for tag grouping therefore
+        comes from one extra per-user query. Project names are resolved via one extra
+        projects read (duplicate names disambiguated with IDs), tag names via the tags
+        read; a running timer inside the range is reported through `running_count`.
         """
 
-        result = await self.get_time_entries(start_date, end_date)
-        project_names: dict[int, str] | None = None
-        if group_by == "project" and any(
-            entry.project_id is not None for entry in result.entries
-        ):
+        self._require_aware_datetime(start_date, name="start_date")
+        self._require_aware_datetime(end_date, name="end_date")
+        if start_date > end_date:
+            raise ValueError("start_date must be before or equal to end_date")
+
+        rows = await self._query_report(start_date, end_date, group_by)
+        if group_by == "project":
+            groups, tracked_seconds, entry_count = await self._project_groups(rows)
+        elif group_by == "date":
+            groups, tracked_seconds, entry_count = self._date_groups(rows)
+        else:
+            groups, tracked_seconds, entry_count = await self._tag_groups(
+                start_date, end_date, rows
+            )
+
+        running_count = 0
+        current = await self.get_current_timer()
+        if current is not None and start_date <= current.start <= end_date:
+            running_count = 1
+
+        return TimeSummary(
+            entry_count=entry_count,
+            tracked_seconds=tracked_seconds,
+            running_count=running_count,
+            possibly_truncated=False,
+            groups=groups,
+        )
+
+    async def _query_report(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        group_by: SummaryGrouping | Literal["user"],
+    ) -> list[dict[str, Any]]:
+        """Run one grouped report query and return its raw `data_json_row` rows."""
+
+        property_name = {
+            "project": "project_id",
+            "date": "start_date",
+            "tag": "tag_ids",
+            "user": "user_account_id",
+        }[group_by]
+        body: dict[str, JsonValue] = {
+            "period": {
+                "from": self._format_rfc3339(start_date),
+                "to": self._format_rfc3339(end_date),
+            },
+            "aggregations": [{"function": "sum", "property": "duration"}],
+            "groupings": [{"property": property_name}],
+        }
+        payload = await self._request_json(
+            "POST",
+            f"/reports/workspaces/{self._config.workspace_id}/query",
+            json=body,
+        )
+        # Verified against the real API: an empty result is `{}` — the data_json_row
+        # key is absent entirely rather than an empty array.
+        if not isinstance(payload, dict):
+            raise TogglResponseFormatError(
+                "Expected a JSON object from the report query endpoint."
+            )
+        rows = payload.get("data_json_row") or []
+        if not isinstance(rows, list):
+            raise TogglResponseFormatError(
+                "Expected a data_json_row array from the report query endpoint."
+            )
+        return [row for row in rows if isinstance(row, dict)]
+
+    @staticmethod
+    def _row_seconds_count(row: dict[str, Any]) -> tuple[int, int]:
+        return int(row.get("sum_duration") or 0), int(row.get("count") or 0)
+
+    async def _project_groups(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[list[SummaryGroup], int, int]:
+        project_ids = {
+            row["project_id"]
+            for row in rows
+            if isinstance(row.get("project_id"), int) and row["project_id"] > 0
+        }
+        names: dict[int, str] = {}
+        if project_ids:
             projects = await self.list_projects()
             name_counts = Counter(project.name for project in projects)
-            project_names = {
+            names = {
                 project.id: (
                     f"{project.name} (project {project.id})"
                     if name_counts[project.name] > 1
@@ -302,12 +392,109 @@ class TogglClient:
                 )
                 for project in projects
             }
-        return summarize_entries(
-            result.entries,
-            group_by=group_by,
-            project_names=project_names,
-            possibly_truncated=result.possibly_truncated,
-        )
+
+        totals: dict[str, list[int]] = {}
+        group_project: dict[str, int] = {}
+        tracked_seconds = 0
+        entry_count = 0
+        for row in rows:
+            seconds, count = self._row_seconds_count(row)
+            tracked_seconds += seconds
+            entry_count += count
+            raw_id = row.get("project_id")
+            project_id = raw_id if isinstance(raw_id, int) and raw_id > 0 else None
+            label = (
+                "(no project)"
+                if project_id is None
+                else names.get(project_id, f"project {project_id}")
+            )
+            bucket = totals.setdefault(label, [0, 0])
+            bucket[0] += seconds
+            bucket[1] += count
+            if project_id is not None:
+                group_project.setdefault(label, project_id)
+
+        ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
+        groups = [
+            SummaryGroup(
+                label=label,
+                seconds=bucket[0],
+                entry_count=bucket[1],
+                project_id=group_project.get(label),
+            )
+            for label, bucket in ordered
+        ]
+        return groups, tracked_seconds, entry_count
+
+    @staticmethod
+    def _date_groups(
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[SummaryGroup], int, int]:
+        totals: dict[str, list[int]] = {}
+        tracked_seconds = 0
+        entry_count = 0
+        for row in rows:
+            seconds, count = TogglClient._row_seconds_count(row)
+            tracked_seconds += seconds
+            entry_count += count
+            label = str(row.get("start_date") or "unknown")
+            bucket = totals.setdefault(label, [0, 0])
+            bucket[0] += seconds
+            bucket[1] += count
+        ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
+        groups = [
+            SummaryGroup(label=label, seconds=bucket[0], entry_count=bucket[1])
+            for label, bucket in ordered
+        ]
+        return groups, tracked_seconds, entry_count
+
+    async def _tag_groups(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[SummaryGroup], int, int]:
+        # Tag rows double-count multi-tag entries, so the exact totals come from one
+        # extra per-user query: every entry has exactly one owner, so summing those
+        # rows counts each entry once.
+        user_rows = await self._query_report(start_date, end_date, "user")
+        tracked_seconds = sum(self._row_seconds_count(row)[0] for row in user_rows)
+        entry_count = sum(self._row_seconds_count(row)[1] for row in user_rows)
+
+        tag_ids = {
+            tag_id
+            for row in rows
+            for tag_id in (row.get("tag_ids") or [])
+            if isinstance(tag_id, int)
+        }
+        tag_names: dict[int, str] = {}
+        if tag_ids:
+            tag_names = {
+                tag.id: tag.name for tag in await self.list_tags() if tag.id is not None
+            }
+
+        totals: dict[str, list[int]] = {}
+        for row in rows:
+            seconds, count = self._row_seconds_count(row)
+            row_tag_ids = row.get("tag_ids") or []
+            labels = (
+                [
+                    tag_names.get(tag_id, f"tag {tag_id}")
+                    for tag_id in row_tag_ids
+                    if isinstance(tag_id, int)
+                ]
+                or ["untagged"]
+            )
+            for label in labels:
+                bucket = totals.setdefault(label, [0, 0])
+                bucket[0] += seconds
+                bucket[1] += count
+        ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
+        groups = [
+            SummaryGroup(label=label, seconds=bucket[0], entry_count=bucket[1])
+            for label, bucket in ordered
+        ]
+        return groups, tracked_seconds, entry_count
 
     async def start_timer(
         self,
@@ -432,11 +619,12 @@ class TogglClient:
     ) -> TimeEntry:
         """Update fields of one time entry; fields left as None stay unchanged.
 
-        The upstream PUT requires `start` and `type`, answers with an empty 204 instead
-        of the updated entry, and preserves omitted optional fields. The client therefore
-        reads the current entry, merges the requested changes, sends the full verified
-        field set, and reads the entry back. Changing the duration of a running entry is
-        rejected locally: stop the timer first.
+        Verified against the Focus API: partial updates go through `PATCH`, whose
+        payload treats absent fields as untouched and supports `project_id` — unlike
+        the PUT route, which silently ignores project changes. The endpoint answers
+        with an empty 204, so the entry is re-read afterwards and a project move is
+        confirmed against the fresh state. Changing the duration of a still-running
+        entry is rejected locally: stop the timer first.
         """
 
         if entry_id <= 0:
@@ -455,73 +643,38 @@ class TogglClient:
             raise ValueError("project_id must be a positive integer")
         if start is not None:
             self._require_aware_datetime(start, name="start")
-        if duration_seconds is not None and duration_seconds <= 0:
-            raise ValueError("duration_seconds must be a positive integer")
+        if duration_seconds is not None:
+            if duration_seconds <= 0:
+                raise ValueError("duration_seconds must be a positive integer")
+            current = await self.get_time_entry(entry_id)
+            if current.duration is None or current.duration < 0:
+                raise ValueError(
+                    "This entry is still running; stop the timer before changing its "
+                    "duration."
+                )
 
-        current = await self.get_time_entry(entry_id)
-        if duration_seconds is not None and (current.duration is None or current.duration < 0):
-            raise ValueError(
-                "This entry is still running; stop the timer before changing its duration."
-            )
+        body: dict[str, JsonValue] = {}
+        if description is not None:
+            body["description"] = description.strip()
+        if project_id is not None:
+            body["project_id"] = project_id
+        if tags is not None:
+            body["tag_ids"] = await self._resolve_tag_ids(tags)
+        if start is not None:
+            body["start"] = self._format_rfc3339(start)
+        if duration_seconds is not None:
+            body["duration"] = duration_seconds
 
-        body = self._entry_put_body(
-            current,
-            description=description.strip() if description is not None else None,
-            project_id=project_id,
-            start=start,
-            duration_seconds=duration_seconds,
-            tag_ids=await self._resolve_tag_ids(tags) if tags is not None else None,
-        )
         await self._request_ok(
-            "PUT", f"{self._scope}/time-entries/{entry_id}", json=body
+            "PATCH", f"{self._scope}/time-entries/{entry_id}", json=body
         )
         final = await self.get_time_entry(entry_id)
         if project_id is not None and final.project_id != project_id:
-            # Verified: the reachable PUT route can silently ignore project changes.
             raise ValueError(
                 "Upstream did not apply the project move; the target project may be "
                 "inactive or unusable for tracking. Other field changes may have applied."
             )
         return final
-
-    @staticmethod
-    def _entry_put_body(
-        current: TimeEntry,
-        *,
-        description: str | None = None,
-        project_id: int | None = None,
-        start: datetime | None = None,
-        duration_seconds: int | None = None,
-        tag_ids: Sequence[int] | None = None,
-    ) -> dict[str, JsonValue]:
-        """Build the full verified PUT body for one entry from its current state.
-
-        The upstream PUT requires `start` and `type`, preserves omitted optional fields,
-        and ignores absent `tag_ids`, so an explicit (possibly empty) `tag_ids` list is
-        the only way to clear tags. A running entry carries no final duration, which is
-        simply omitted.
-        """
-
-        body: dict[str, JsonValue] = {
-            "type": current.entry_type or "activity",
-            "billable": current.billable,
-            "start": TogglClient._format_rfc3339(
-                start if start is not None else current.start
-            ),
-        }
-        final_description = description if description is not None else current.description
-        if final_description is not None:
-            body["description"] = final_description
-        if duration_seconds is not None:
-            body["duration"] = duration_seconds
-        elif current.duration is not None:
-            body["duration"] = current.duration
-        body["project_id"] = project_id if project_id is not None else current.project_id
-        if tag_ids is not None:
-            body["tag_ids"] = list(tag_ids)
-        elif current.tag_ids:
-            body["tag_ids"] = list(current.tag_ids)
-        return body
 
     async def bulk_edit_time_entries(
         self,
@@ -531,14 +684,17 @@ class TogglClient:
         remove_tags: Sequence[str] | None = None,
         project_id: int | None = None,
     ) -> list[BulkEditOutcome]:
-        """Apply tag and project changes to many entries, one verified request pair each.
+        """Apply tag and project changes to many entries through the bulk-edit endpoint.
 
-        The upstream bulk PATCH endpoint is not reachable under this base URL (verified),
-        so the change set is applied per entry over the single-entry routes. Tag changes
-        are applied and trusted; a project move is re-read and confirmed, because the
-        upstream PUT silently ignores project changes on the reachable routes (verified
-        across field-name variants). One failure never blocks the remaining entries, and
-        a silently ignored move is reported as a failure, never as success.
+        Verified against the Focus API: `PATCH /time-entries/bulk-edit` accepts
+        `{ids, changes}` where `changes.tag_ids` is tri-state (absent leaves tags
+        untouched, a list sets them) and `changes.project_id` moves entries — the
+        single-entry PUT route cannot do project moves. The current state of every
+        requested entry is read in one batch call, entries are grouped by their
+        resulting tag set, and one bulk-edit call is issued per group. The upstream
+        answers with an empty 204, so outcomes are derived client-side: entries missing
+        from the batch read fail, and a project move is confirmed by re-reading the
+        affected entries.
         """
 
         clean_ids = list(dict.fromkeys(entry_ids))
@@ -559,51 +715,172 @@ class TogglClient:
         add_ids = await self._resolve_tag_ids(add_tags) if add_tags else []
         remove_ids = await self._resolve_tag_ids(remove_tags) if remove_tags else []
 
+        batch = await self._get_entries_by_ids(clean_ids)
+        by_id = {entry.id: entry for entry in batch}
+        groups: dict[tuple[int, ...] | None, list[int]] = {}
         outcomes: list[BulkEditOutcome] = []
         for entry_id in clean_ids:
-            outcomes.append(
-                await self._bulk_edit_one(
-                    entry_id,
-                    add_ids=add_ids,
-                    remove_ids=remove_ids,
-                    project_id=project_id,
-                    move_requested=project_id is not None,
+            entry = by_id.get(entry_id)
+            if entry is None:
+                outcomes.append(
+                    BulkEditOutcome(
+                        entry_id=entry_id,
+                        updated=False,
+                        error="Entry not found or not accessible in this workspace.",
+                    )
                 )
-            )
-        return outcomes
+                continue
+            merged = [t for t in entry.tag_ids if t not in remove_ids]
+            for tag_id in add_ids:
+                if tag_id not in merged:
+                    merged.append(tag_id)
+            key = tuple(merged) if (add_tags or remove_tags) else None
+            groups.setdefault(key, []).append(entry_id)
 
-    async def _bulk_edit_one(
-        self,
-        entry_id: int,
-        *,
-        add_ids: list[int],
-        remove_ids: list[int],
-        project_id: int | None,
-        move_requested: bool,
-    ) -> BulkEditOutcome:
         move_note = (
             "the project move was not applied by upstream; the target project may be "
             "inactive or unusable for tracking"
         )
-        try:
-            current = await self.get_time_entry(entry_id)
-            merged_tag_ids = [t for t in current.tag_ids if t not in remove_ids]
-            for tag_id in add_ids:
-                if tag_id not in merged_tag_ids:
-                    merged_tag_ids.append(tag_id)
-            body = self._entry_put_body(
-                current, project_id=project_id, tag_ids=merged_tag_ids
-            )
-            await self._request_ok(
-                "PUT", f"{self._scope}/time-entries/{entry_id}", json=body
-            )
-            if move_requested:
-                final = await self.get_time_entry(entry_id)
-                if final.project_id != project_id:
-                    return BulkEditOutcome(entry_id=entry_id, updated=False, error=move_note)
-            return BulkEditOutcome(entry_id=entry_id, updated=True)
-        except (TogglError, ValueError) as exc:
-            return BulkEditOutcome(entry_id=entry_id, updated=False, error=str(exc))
+        for key, group_ids in groups.items():
+            changes: dict[str, JsonValue] = {}
+            if project_id is not None:
+                changes["project_id"] = project_id
+            if key is not None:
+                changes["tag_ids"] = list(key)
+            try:
+                await self._request_ok(
+                    "PATCH",
+                    f"{self._scope}/time-entries/bulk-edit",
+                    json={"ids": group_ids, "changes": changes},
+                )
+            except TogglError as exc:
+                for entry_id in group_ids:
+                    outcomes.append(
+                        BulkEditOutcome(entry_id=entry_id, updated=False, error=str(exc))
+                    )
+                continue
+            if project_id is None:
+                for entry_id in group_ids:
+                    outcomes.append(BulkEditOutcome(entry_id=entry_id, updated=True))
+                continue
+            after = {entry.id: entry for entry in await self._get_entries_by_ids(group_ids)}
+            for entry_id in group_ids:
+                final = after.get(entry_id)
+                if final is None or final.project_id != project_id:
+                    outcomes.append(
+                        BulkEditOutcome(entry_id=entry_id, updated=False, error=move_note)
+                    )
+                else:
+                    outcomes.append(BulkEditOutcome(entry_id=entry_id, updated=True))
+
+        order = {entry_id: index for index, entry_id in enumerate(clean_ids)}
+        outcomes.sort(key=lambda outcome: order.get(outcome.entry_id, len(order)))
+        return outcomes
+
+    async def _get_entries_by_ids(self, entry_ids: Sequence[int]) -> list[TimeEntry]:
+        """Read the current state of specific entries in one batch call."""
+
+        payload = await self._request_json(
+            "GET",
+            f"{self._scope}/time-entries/batch",
+            params={"ids": ",".join(str(entry_id) for entry_id in entry_ids)},
+        )
+        if not isinstance(payload, list):
+            raise TogglResponseFormatError("Expected a JSON array from the batch endpoint.")
+        return [self._validate(TimeEntry, item) for item in payload]
+
+    async def bulk_delete_time_entries(
+        self,
+        entry_ids: Sequence[int],
+    ) -> list[BulkDeleteOutcome]:
+        """Permanently delete many time entries through the bulk endpoint.
+
+        Verified against the Focus API: `DELETE /time-entries/bulk?ids=<csv>` answers an
+        empty 204 and the batch endpoint silently omits IDs that no longer exist, so
+        every deletion is confirmed by re-reading the requested IDs afterwards. The
+        current state is read first so unknown IDs fail individually instead of letting
+        one bad ID reject the whole delete request. IDs are deleted in chunks to stay
+        within URL length limits; one chunk's failure never blocks the others.
+        """
+
+        clean_ids = list(dict.fromkeys(entry_ids))
+        if not clean_ids:
+            raise ValueError("entry_ids must not be empty")
+        if any(entry_id <= 0 for entry_id in clean_ids):
+            raise ValueError("entry_ids must all be positive integers")
+
+        missing_note = "Entry not found or not accessible in this workspace."
+        outcomes: list[BulkDeleteOutcome] = []
+        deletable: list[int] = []
+        batch = await self._get_entries_by_ids(clean_ids)
+        by_id = {entry.id: entry for entry in batch}
+        for entry_id in clean_ids:
+            if entry_id in by_id:
+                deletable.append(entry_id)
+            else:
+                outcomes.append(
+                    BulkDeleteOutcome(entry_id=entry_id, deleted=False, error=missing_note)
+                )
+
+        for chunk_start in range(0, len(deletable), BULK_CHUNK):
+            chunk = deletable[chunk_start : chunk_start + BULK_CHUNK]
+            try:
+                await self._request_ok(
+                    "DELETE",
+                    f"{self._scope}/time-entries/bulk",
+                    params={"ids": ",".join(str(entry_id) for entry_id in chunk)},
+                )
+            except TogglError as exc:
+                for entry_id in chunk:
+                    outcomes.append(
+                        BulkDeleteOutcome(entry_id=entry_id, deleted=False, error=str(exc))
+                    )
+                continue
+            try:
+                survivors = await self._get_entries_by_ids(chunk)
+            except TogglNotFoundError:
+                # The batch read 404s when none of the IDs exist anymore, which means
+                # every deletion in this chunk was applied.
+                survivors = []
+            except TogglError as exc:
+                note = f"Delete was accepted but the confirmation read failed: {exc}"
+                for entry_id in chunk:
+                    outcomes.append(
+                        BulkDeleteOutcome(entry_id=entry_id, deleted=False, error=note)
+                    )
+                continue
+            survivor_ids = {entry.id for entry in survivors}
+            for entry_id in chunk:
+                if entry_id in survivor_ids:
+                    outcomes.append(
+                        BulkDeleteOutcome(
+                            entry_id=entry_id,
+                            deleted=False,
+                            error="Upstream accepted the delete but this entry still exists.",
+                        )
+                    )
+                else:
+                    outcomes.append(BulkDeleteOutcome(entry_id=entry_id, deleted=True))
+
+        order = {entry_id: index for index, entry_id in enumerate(clean_ids)}
+        outcomes.sort(key=lambda outcome: order.get(outcome.entry_id, len(order)))
+        return outcomes
+
+    async def get_me_settings(self) -> UserSettings:
+        """Read the authenticated user's Focus settings."""
+
+        payload = await self._request_json("GET", "/users/me/settings")
+        return self._validate(UserSettings, self._unwrap_data(payload))
+
+    async def list_workspace_members(self) -> list[WorkspaceMember]:
+        """List the members of the configured organization with their workspaces."""
+
+        payload = await self._request_json(
+            "GET", f"/organizations/{self._config.organization_id}/users"
+        )
+        if not isinstance(payload, list):
+            raise TogglResponseFormatError("Expected a JSON array of organization users.")
+        return [self._validate(WorkspaceMember, item) for item in payload]
 
     async def delete_time_entry(self, entry_id: int) -> None:
         """Permanently delete one time entry of the configured workspace."""
@@ -739,11 +1016,12 @@ class TogglClient:
         path: str,
         *,
         json: dict[str, JsonValue] | None = None,
+        params: Mapping[str, str | int] | None = None,
     ) -> None:
         """Perform a request whose success body carries no useful JSON (e.g. deletes, PUT)."""
 
         try:
-            response = await self._http.request(method, path, json=json)
+            response = await self._http.request(method, path, json=json, params=params)
         except httpx.TimeoutException as exc:
             raise TogglNetworkError("Timed out while contacting Toggl Track.") from exc
         except httpx.RequestError as exc:

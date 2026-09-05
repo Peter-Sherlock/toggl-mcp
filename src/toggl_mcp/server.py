@@ -34,6 +34,8 @@ from toggl_mcp.exceptions import (
     TogglServerError,
 )
 from toggl_mcp.tool_models import (
+    BulkDeleteOutcomeSummary,
+    BulkDeleteTimeEntriesOutput,
     BulkEditOutcomeSummary,
     BulkEditTimeEntriesOutput,
     ClientSummary,
@@ -42,9 +44,14 @@ from toggl_mcp.tool_models import (
     CurrentTimerOutput,
     DeletedEntityOutput,
     ListClientsOutput,
+    ListPlannedEntriesOutput,
     ListProjectsOutput,
     ListTagsOutput,
     ListTasksOutput,
+    ListWorkspaceMembersOutput,
+    MemberSummary,
+    MeSettingsOutput,
+    PlannedEntrySummary,
     ProjectSummary,
     StartTimerOutput,
     StopTimerOutput,
@@ -244,6 +251,41 @@ def create_server(
         annotations=read_annotations,
         structured_output=True,
         description=(
+            "List planned (calendar-scheduled) entries whose planned start falls within a "
+            "timezone-aware interval. Entries that already carry tracked time are excluded; "
+            "use get_time_entries for those."
+        ),
+    )
+    async def list_planned_entries(
+        start_date: Annotated[
+            datetime,
+            Field(description="Interval start as an ISO 8601 timestamp with timezone."),
+        ],
+        end_date: Annotated[
+            datetime,
+            Field(description="Interval end as an ISO 8601 timestamp with timezone."),
+        ],
+        context: Context[ServerState, Any],
+    ) -> ListPlannedEntriesOutput:
+        result = await _execute(
+            "list_planned_entries",
+            lambda: _state(context).client.list_planned_entries(start_date, end_date),
+        )
+        entries = [
+            PlannedEntrySummary.from_planned_entry(entry) for entry in result.entries
+        ]
+        return ListPlannedEntriesOutput(
+            start_date=start_date,
+            end_date=end_date,
+            count=len(entries),
+            possibly_truncated=result.possibly_truncated,
+            entries=entries,
+        )
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
             "List clients (customers) of the configured Toggl workspace. Client IDs are "
             "accepted by create_project."
         ),
@@ -330,6 +372,39 @@ def create_server(
                 for group in summary.groups
             ],
         )
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
+            "Read the authenticated Toggl user's settings, including the workspace they "
+            "currently have selected. Use it to confirm this server's configured "
+            "workspace matches the user's expectation."
+        ),
+    )
+    async def get_me(context: Context[ServerState, Any]) -> MeSettingsOutput:
+        settings = await _execute(
+            "get_me", _state(context).client.get_me_settings
+        )
+        return MeSettingsOutput.from_settings(settings)
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
+            "List the members of this Toggl organization with the workspaces each "
+            "member belongs to. Filter by workspace_ids to answer 'who is in my "
+            "workspace'."
+        ),
+    )
+    async def list_workspace_members(
+        context: Context[ServerState, Any],
+    ) -> ListWorkspaceMembersOutput:
+        members = await _execute(
+            "list_workspace_members", _state(context).client.list_workspace_members
+        )
+        summaries = [MemberSummary.from_member(member) for member in members]
+        return ListWorkspaceMembersOutput(count=len(summaries), members=summaries)
 
     writes_enabled = _write_tools_enabled() if enable_write_tools is None else enable_write_tools
     if writes_enabled:
@@ -540,6 +615,40 @@ def create_server(
                     BulkEditOutcomeSummary(
                         entry_id=outcome.entry_id,
                         updated=outcome.updated,
+                        error=outcome.error,
+                    )
+                    for outcome in outcomes
+                ],
+            )
+
+        @server.tool(
+            annotations=delete_annotations,
+            structured_output=True,
+            description=(
+                "Permanently delete many time entries by ID in one call. Every entry is "
+                "reported individually; one failure never blocks the rest. This is "
+                "destructive and cannot be undone through Toggl."
+            ),
+        )
+        async def bulk_delete_time_entries(
+            entry_ids: Annotated[
+                list[int],
+                Field(min_length=1, description="Time-entry IDs to delete, without duplicates."),
+            ],
+            *,
+            context: Context[ServerState, Any],
+        ) -> BulkDeleteTimeEntriesOutput:
+            outcomes = await _execute(
+                "bulk_delete_time_entries",
+                lambda: _state(context).client.bulk_delete_time_entries(entry_ids),
+            )
+            return BulkDeleteTimeEntriesOutput(
+                deleted_count=sum(1 for outcome in outcomes if outcome.deleted),
+                failed_count=sum(1 for outcome in outcomes if not outcome.deleted),
+                outcomes=[
+                    BulkDeleteOutcomeSummary(
+                        entry_id=outcome.entry_id,
+                        deleted=outcome.deleted,
                         error=outcome.error,
                     )
                     for outcome in outcomes

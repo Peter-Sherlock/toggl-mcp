@@ -21,16 +21,21 @@ READ_TOOL_NAMES = [
     "get_current_timer",
     "get_time_entries",
     "get_time_entry",
+    "list_planned_entries",
     "list_clients",
     "list_tags",
     "list_tasks",
     "summarize_time",
+    "get_me",
+    "list_workspace_members",
 ]
 WRITE_TOOL_NAMES = [
     "start_timer",
     "stop_timer",
     "create_time_entry",
     "update_time_entry",
+    "bulk_edit_time_entries",
+    "bulk_delete_time_entries",
     "delete_time_entry",
     "create_project",
     "update_project",
@@ -112,6 +117,15 @@ async def verify(*, enable_writes: bool, list_only: bool) -> None:
             _structured_result("get_time_entries", entries),
         )
 
+        planned = await client.call_tool(
+            "list_planned_entries",
+            {"start_date": start.isoformat(), "end_date": now.isoformat()},
+        )
+        _print_result(
+            "list_planned_entries",
+            _structured_result("list_planned_entries", planned),
+        )
+
         clients = await client.call_tool("list_clients")
         _print_result("list_clients", _structured_result("list_clients", clients))
 
@@ -129,6 +143,15 @@ async def verify(*, enable_writes: bool, list_only: bool) -> None:
         _print_result(
             "summarize_time",
             _structured_result("summarize_time", summary),
+        )
+
+        me = await client.call_tool("get_me")
+        _print_result("get_me", _structured_result("get_me", me))
+
+        members = await client.call_tool("list_workspace_members")
+        _print_result(
+            "list_workspace_members",
+            _structured_result("list_workspace_members", members),
         )
 
         if project_ids:

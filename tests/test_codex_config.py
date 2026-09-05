@@ -15,6 +15,14 @@ from toggl_mcp.server import create_server
 
 CODEX_CONFIG_PATH = Path(__file__).resolve().parents[2] / ".codex" / "config.toml"
 
+# The project-scoped Codex configuration intentionally lives outside this repository
+# (next to the Codex workspace root), so CI checkouts cannot see it. The drift guard
+# runs locally, where the file exists.
+requires_codex_config = pytest.mark.skipif(
+    not CODEX_CONFIG_PATH.is_file(),
+    reason="Project-scoped Codex config lives outside this repository checkout",
+)
+
 
 def _codex_server_config() -> dict[str, object]:
     assert CODEX_CONFIG_PATH.is_file(), (
@@ -35,6 +43,7 @@ def _offline_config() -> TogglConfig:
     )
 
 
+@requires_codex_config
 @pytest.mark.asyncio
 async def test_codex_enabled_tools_match_registered_tools() -> None:
     server_config = _codex_server_config()
@@ -55,6 +64,7 @@ async def test_codex_enabled_tools_match_registered_tools() -> None:
     )
 
 
+@requires_codex_config
 def test_codex_write_gate_matches_enabled_write_tools() -> None:
     server_config = _codex_server_config()
     enabled = server_config["enabled_tools"]

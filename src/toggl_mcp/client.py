@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Literal, TypeVar
 
 import httpx
@@ -46,12 +46,17 @@ from toggl_mcp.models import (
 ModelT = TypeVar("ModelT", bound=BaseModel)
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 
-SummaryGrouping = Literal["project", "date", "tag"]
+SummaryGrouping = Literal["project", "date", "week", "tag"]
 
-# Safety guard so a misbehaving upstream that keeps returning full pages cannot hang the
+# Safety guards so a misbehaving upstream that keeps returning full pages cannot hang the
 # client in an infinite pagination loop. With the default page size of 100 this allows
 # far more entries than Toggl's documented 1000-entry range cap.
 MAX_PAGES = 100
+
+# The report query endpoint paginates its grouped rows the same way (verified: the
+# `pagination` body field caps `data_json_row`), so those pages are followed explicitly.
+REPORT_PAGE_SIZE = 100
+MAX_REPORT_PAGES = 50
 
 # IDs travel in the bulk endpoints' query string, so large batches are chunked to stay
 # within URL length limits.
@@ -305,6 +310,8 @@ class TogglClient:
         end_date: datetime,
         *,
         group_by: SummaryGrouping = "project",
+        project_id: int | None = None,
+        user_account_id: int | None = None,
     ) -> TimeSummary:
         """Aggregate tracked time over an aware range via Toggl's native report engine.
 
@@ -316,22 +323,34 @@ class TogglClient:
         comes from one extra per-user query. Project names are resolved via one extra
         projects read (duplicate names disambiguated with IDs), tag names via the tags
         read; a running timer inside the range is reported through `running_count`.
+
+        Optional filters combine with AND and use the upstream `"="` operator (the only
+        equality operator it accepts; verified). Tag filtering is deliberately not
+        offered: the upstream rejects every workable shape for `tag_ids` filters
+        (verified). Weekly grouping is bucketed client-side from the daily rows into
+        ISO weeks, because the native `week` grouping reports bare week numbers
+        without a year.
         """
 
         self._require_aware_datetime(start_date, name="start_date")
         self._require_aware_datetime(end_date, name="end_date")
         if start_date > end_date:
             raise ValueError("start_date must be before or equal to end_date")
+        filters = self._report_filters(project_id=project_id, user_account_id=user_account_id)
 
-        rows = await self._query_report(start_date, end_date, group_by)
-        if group_by == "project":
-            groups, tracked_seconds, entry_count = await self._project_groups(rows)
-        elif group_by == "date":
-            groups, tracked_seconds, entry_count = self._date_groups(rows)
+        if group_by == "week":
+            rows = await self._query_report(start_date, end_date, "date", filters=filters)
+            groups, tracked_seconds, entry_count = self._week_groups(rows)
         else:
-            groups, tracked_seconds, entry_count = await self._tag_groups(
-                start_date, end_date, rows
-            )
+            rows = await self._query_report(start_date, end_date, group_by, filters=filters)
+            if group_by == "project":
+                groups, tracked_seconds, entry_count = await self._project_groups(rows)
+            elif group_by == "date":
+                groups, tracked_seconds, entry_count = self._date_groups(rows)
+            else:
+                groups, tracked_seconds, entry_count = await self._tag_groups(
+                    start_date, end_date, rows, filters=filters
+                )
 
         running_count = 0
         current = await self.get_current_timer()
@@ -346,13 +365,41 @@ class TogglClient:
             groups=groups,
         )
 
+    @staticmethod
+    def _report_filters(
+        *,
+        project_id: int | None,
+        user_account_id: int | None,
+    ) -> list[dict[str, JsonValue]]:
+        """Build the verified `"=" filter list; empty means unfiltered."""
+
+        filters: list[dict[str, JsonValue]] = []
+        if project_id is not None:
+            if project_id <= 0:
+                raise ValueError("project_id must be a positive integer")
+            filters.append({"property": "project_id", "operator": "=", "value": project_id})
+        if user_account_id is not None:
+            if user_account_id <= 0:
+                raise ValueError("user_account_id must be a positive integer")
+            filters.append(
+                {"property": "user_account_id", "operator": "=", "value": user_account_id}
+            )
+        return filters
+
     async def _query_report(
         self,
         start_date: datetime,
         end_date: datetime,
         group_by: SummaryGrouping | Literal["user"],
+        *,
+        filters: list[dict[str, JsonValue]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run one grouped report query and return its raw `data_json_row` rows."""
+        """Run one grouped report query and return its raw `data_json_row` rows.
+
+        Grouped rows are paginated (verified: the `pagination` body field caps the
+        rows), so pages are followed until a short page; the safety page limit guards
+        against a misbehaving upstream.
+        """
 
         property_name = {
             "project": "project_id",
@@ -360,31 +407,44 @@ class TogglClient:
             "tag": "tag_ids",
             "user": "user_account_id",
         }[group_by]
-        body: dict[str, JsonValue] = {
-            "period": {
-                "from": self._format_rfc3339(start_date),
-                "to": self._format_rfc3339(end_date),
-            },
-            "aggregations": [{"function": "sum", "property": "duration"}],
-            "groupings": [{"property": property_name}],
-        }
-        payload = await self._request_json(
-            "POST",
-            f"/reports/workspaces/{self._config.workspace_id}/query",
-            json=body,
-        )
-        # Verified against the real API: an empty result is `{}` — the data_json_row
-        # key is absent entirely rather than an empty array.
-        if not isinstance(payload, dict):
-            raise TogglResponseFormatError(
-                "Expected a JSON object from the report query endpoint."
+        rows: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            body: dict[str, JsonValue] = {
+                "period": {
+                    "from": self._format_rfc3339(start_date),
+                    "to": self._format_rfc3339(end_date),
+                },
+                "aggregations": [{"function": "sum", "property": "duration"}],
+                "groupings": [{"property": property_name}],
+                "pagination": {"page": page, "per_page": REPORT_PAGE_SIZE},
+            }
+            if filters:
+                body["filters"] = filters
+            payload = await self._request_json(
+                "POST",
+                f"/reports/workspaces/{self._config.workspace_id}/query",
+                json=body,
             )
-        rows = payload.get("data_json_row") or []
-        if not isinstance(rows, list):
-            raise TogglResponseFormatError(
-                "Expected a data_json_row array from the report query endpoint."
-            )
-        return [row for row in rows if isinstance(row, dict)]
+            # Verified against the real API: an empty result is `{}` — the data_json_row
+            # key is absent entirely rather than an empty array.
+            if not isinstance(payload, dict):
+                raise TogglResponseFormatError(
+                    "Expected a JSON object from the report query endpoint."
+                )
+            page_rows = payload.get("data_json_row") or []
+            if not isinstance(page_rows, list):
+                raise TogglResponseFormatError(
+                    "Expected a data_json_row array from the report query endpoint."
+                )
+            rows.extend(row for row in page_rows if isinstance(row, dict))
+            if len(page_rows) < REPORT_PAGE_SIZE:
+                return rows
+            if page >= MAX_REPORT_PAGES:
+                raise TogglResponseFormatError(
+                    "Report pagination did not terminate within the safety page limit."
+                )
+            page += 1
 
     @staticmethod
     def _row_seconds_count(row: dict[str, Any]) -> tuple[int, int]:
@@ -466,16 +526,53 @@ class TogglClient:
         ]
         return groups, tracked_seconds, entry_count
 
+    @staticmethod
+    def _week_groups(
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[SummaryGroup], int, int]:
+        """Bucket daily report rows into ISO weeks, labeled with the ISO year.
+
+        The engine has a native `week` grouping, verified to answer bare week numbers
+        without a year, which is ambiguous across year boundaries — weekly totals
+        therefore come from the unambiguous daily rows instead.
+        """
+
+        totals: dict[str, list[int]] = {}
+        tracked_seconds = 0
+        entry_count = 0
+        for row in rows:
+            seconds, count = TogglClient._row_seconds_count(row)
+            tracked_seconds += seconds
+            entry_count += count
+            raw_date = row.get("start_date")
+            try:
+                iso = date.fromisoformat(str(raw_date)).isocalendar()
+                label = f"{iso.year}-W{iso.week:02d}"
+            except ValueError:
+                label = "unknown"
+            bucket = totals.setdefault(label, [0, 0])
+            bucket[0] += seconds
+            bucket[1] += count
+        ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
+        groups = [
+            SummaryGroup(label=label, seconds=bucket[0], entry_count=bucket[1])
+            for label, bucket in ordered
+        ]
+        return groups, tracked_seconds, entry_count
+
     async def _tag_groups(
         self,
         start_date: datetime,
         end_date: datetime,
         rows: list[dict[str, Any]],
+        *,
+        filters: list[dict[str, JsonValue]] | None = None,
     ) -> tuple[list[SummaryGroup], int, int]:
         # Tag rows double-count multi-tag entries, so the exact totals come from one
         # extra per-user query: every entry has exactly one owner, so summing those
-        # rows counts each entry once.
-        user_rows = await self._query_report(start_date, end_date, "user")
+        # rows counts each entry once. The same filters must apply, or the exact
+        # totals would not match the filtered groups.
+        user_rows = await self._query_report(start_date, end_date, "user", filters=filters)
         tracked_seconds = sum(self._row_seconds_count(row)[0] for row in user_rows)
         entry_count = sum(self._row_seconds_count(row)[1] for row in user_rows)
 

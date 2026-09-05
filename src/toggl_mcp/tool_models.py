@@ -416,7 +416,10 @@ class SummaryGroupOutput(ToolOutput):
     """One aggregation bucket of a time summary."""
 
     label: str = Field(
-        description="Project name, UTC date (YYYY-MM-DD), or tag name for this bucket."
+        description=(
+            "Project name, UTC date (YYYY-MM-DD), ISO week (YYYY-Www), or tag name "
+            "for this bucket."
+        )
     )
     seconds: int = Field(description="Tracked seconds aggregated under this label.")
     entry_count: int = Field(description="Number of finished entries under this label.")
@@ -430,7 +433,9 @@ class SummarizeTimeOutput(ToolOutput):
 
     start_date: datetime
     end_date: datetime
-    group_by: str = Field(description="Aggregation bucket used for groups.")
+    group_by: str = Field(
+        description="Aggregation bucket used for groups: project, date, week, or tag."
+    )
     entry_count: int = Field(
         description="All entries in the interval, including still-running ones."
     )

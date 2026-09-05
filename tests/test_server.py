@@ -661,6 +661,55 @@ async def test_update_client_and_delete_tag_round_trip() -> None:
 
 
 @pytest.mark.asyncio
+async def test_summarize_time_week_grouping_with_project_filter() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path.endswith("/query"):
+            # 2026-08-17 (Mon) and 2026-08-23 (Sun) share ISO week 34.
+            return httpx.Response(
+                200,
+                json={
+                    "data_json_row": [
+                        {"count": 3, "start_date": "2026-08-17", "sum_duration": 16959},
+                        {"count": 1, "start_date": "2026-08-23", "sum_duration": 3600},
+                    ]
+                },
+            )
+        if request.url.path.endswith("/tracking/current"):
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=False,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "summarize_time",
+            {
+                "start_date": "2026-08-15T00:00:00+00:00",
+                "end_date": "2026-08-25T00:00:00+00:00",
+                "group_by": "week",
+                "project_id": 88,
+            },
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["group_by"] == "week"
+    assert result.structured_content["tracked_seconds"] == 20559
+    assert result.structured_content["groups"] == [
+        {"label": "2026-W34", "seconds": 20559, "entry_count": 4, "project_id": None}
+    ]
+    body = json.loads(captured[0].content)
+    assert body["filters"] == [{"property": "project_id", "operator": "=", "value": 88}]
+
+
+@pytest.mark.asyncio
 async def test_summarize_time_returns_structured_groups() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/query"):

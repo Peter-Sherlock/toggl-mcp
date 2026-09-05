@@ -395,8 +395,9 @@ def create_server(
         annotations=read_annotations,
         structured_output=True,
         description=(
-            "Summarize tracked time in a timezone-aware interval, grouped by project, UTC "
-            "date, or tag. Computed from the raw entries; when possibly_truncated is true, "
+            "Summarize tracked time in a timezone-aware interval, grouped by project, "
+            "UTC date, ISO week, or tag — optionally filtered to one project and/or one "
+            "member. Computed by Toggl's report engine; when possibly_truncated is true, "
             "treat every total as a lower bound and narrow the interval before reporting."
         ),
     )
@@ -410,16 +411,34 @@ def create_server(
             Field(description="Interval end as an ISO 8601 timestamp with timezone."),
         ],
         group_by: Annotated[
-            Literal["project", "date", "tag"],
+            Literal["project", "date", "week", "tag"],
             Field(description="Aggregation bucket for the returned groups."),
         ] = "project",
+        project_id: Annotated[
+            int | None,
+            Field(gt=0, description="Only count time on this project (from list_projects)."),
+        ] = None,
+        user_account_id: Annotated[
+            int | None,
+            Field(
+                gt=0,
+                description=(
+                    "Only count time tracked by this member (organization user ID from "
+                    "list_workspace_members)."
+                ),
+            ),
+        ] = None,
         *,
         context: Context[ServerState, Any],
     ) -> SummarizeTimeOutput:
         summary = await _execute(
             "summarize_time",
             lambda: _state(context).client.summarize_time(
-                start_date, end_date, group_by=group_by
+                start_date,
+                end_date,
+                group_by=group_by,
+                project_id=project_id,
+                user_account_id=user_account_id,
             ),
         )
         return SummarizeTimeOutput(

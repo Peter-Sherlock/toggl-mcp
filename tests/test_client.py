@@ -7,7 +7,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from toggl_mcp.client import TogglClient
+from toggl_mcp.client import REPORT_PAGE_SIZE, TogglClient
 from toggl_mcp.config import TogglConfig
 from toggl_mcp.exceptions import (
     TimerAlreadyRunningError,
@@ -1230,6 +1230,112 @@ async def test_summarize_time_tolerates_empty_result_object() -> None:
     assert summary.groups == []
     assert summary.tracked_seconds == 0
     assert summary.entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_week_groups_bucket_iso_weeks_across_years() -> None:
+    requests: list[httpx.Request] = []
+    transport = _query_handler(
+        requests,
+        rows=[
+            # 2025-12-29 and 2026-01-03 both sit in ISO week 1 of 2026.
+            {"count": 2, "start_date": "2025-12-29", "sum_duration": 120},
+            {"count": 1, "start_date": "2026-01-03", "sum_duration": 60},
+            {"count": 1, "start_date": "2026-01-05", "sum_duration": 30},
+        ],
+    )
+    async with TogglClient(config(), transport=transport) as client:
+        summary = await client.summarize_time(
+            datetime(2025, 12, 28, tzinfo=UTC),
+            datetime(2026, 1, 11, tzinfo=UTC),
+            group_by="week",
+        )
+
+    assert [(g.label, g.seconds, g.entry_count) for g in summary.groups] == [
+        ("2026-W01", 180, 3),
+        ("2026-W02", 30, 1),
+    ]
+    # Weekly totals come from the daily grouping, not the year-blind native weeks.
+    query_body = json.loads(requests[0].content)
+    assert query_body["groupings"] == [{"property": "start_date"}]
+    assert "filters" not in query_body
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_sends_eq_filters_and_follows_report_pagination() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tracking/current"):
+            return httpx.Response(204)
+        body = json.loads(request.content)
+        assert body["filters"] == [{"property": "project_id", "operator": "=", "value": 88}]
+        page = body["pagination"]["page"]
+        if page == 1:
+            rows = [
+                {"count": 1, "start_date": f"day-{index:03d}", "sum_duration": 5}
+                for index in range(REPORT_PAGE_SIZE)
+            ]
+        else:
+            rows = [{"count": 2, "start_date": "day-last", "sum_duration": 7}]
+        return httpx.Response(200, json={"data_json_row": rows})
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        summary = await client.summarize_time(
+            datetime(2026, 8, 15, tzinfo=UTC),
+            datetime(2026, 9, 15, tzinfo=UTC),
+            group_by="date",
+            project_id=88,
+        )
+
+    query_requests = [r for r in requests if r.url.path.endswith("/query")]
+    assert len(query_requests) == 2
+    first_body = json.loads(query_requests[0].content)
+    assert first_body["pagination"] == {"page": 1, "per_page": REPORT_PAGE_SIZE}
+    assert summary.entry_count == REPORT_PAGE_SIZE + 2
+    assert summary.tracked_seconds == REPORT_PAGE_SIZE * 5 + 7
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_tag_totals_apply_the_same_filters() -> None:
+    requests: list[httpx.Request] = []
+    transport = _query_handler(
+        requests,
+        rows=[{"count": 1, "tag_ids": [7], "sum_duration": 600}],
+        user_rows=[{"count": 1, "user_account_id": 7663892, "sum_duration": 600}],
+        tags=[{"id": 7, "name": "learning", "workspace_id": WORKSPACE_ID}],
+    )
+    async with TogglClient(config(), transport=transport) as client:
+        summary = await client.summarize_time(
+            datetime(2026, 8, 15, tzinfo=UTC),
+            datetime(2026, 9, 5, tzinfo=UTC),
+            group_by="tag",
+            project_id=88,
+        )
+
+    # Both the tag-grouped query and the exact-totals query carry the filter.
+    query_bodies = [
+        json.loads(r.content) for r in requests if r.url.path.endswith("/query")
+    ]
+    assert len(query_bodies) == 2
+    expected_filter = [{"property": "project_id", "operator": "=", "value": 88}]
+    assert all(body["filters"] == expected_filter for body in query_bodies)
+    assert summary.tracked_seconds == 600
+
+
+@pytest.mark.asyncio
+async def test_summarize_time_rejects_nonpositive_filter_ids_before_network() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("network should not be called")
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        with pytest.raises(ValueError, match="positive integer"):
+            await client.summarize_time(NOW, NOW, project_id=0)
+        with pytest.raises(ValueError, match="positive integer"):
+            await client.summarize_time(NOW, NOW, user_account_id=-1)
 
 
 @pytest.mark.asyncio

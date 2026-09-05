@@ -21,7 +21,8 @@ Read tools are exposed by default:
 - `list_tags()`
 - `list_tasks(project_id)` — requires a Toggl plan with the tasks feature; other plans
   answer 404, which surfaces as a clean "not found" tool error.
-- `summarize_time(start_date, end_date, group_by="project"|"date"|"tag")`
+- `summarize_time(start_date, end_date, group_by="project"|"date"|"week"|"tag",
+  project_id=None, user_account_id=None)`
 - `get_me()` — the authenticated user's settings, including the workspace they have
   selected in Toggl.
 - `list_workspace_members()` — the organization's members with their workspace
@@ -45,9 +46,20 @@ aggregation happens server-side; the client resolves labels and exact entry tota
 - Project names resolve via one extra projects read (duplicates disambiguated with IDs);
   tag names via the tags read; a running timer inside the range is reported through
   `running_count`.
-- `possibly_truncated` is always false here: aggregation is server-side, so the range
-  endpoint's cap does not apply. Row-cap behavior of the query endpoint is undocumented —
-  pending external verification for very large result sets.
+- Optional filters combine with AND and use the upstream `"="` operator — the only
+  equality operator it accepts (`equals` is rejected, verified). Filtering by
+  `project_id` and by `user_account_id` is verified live. **Tag filtering is not
+  offered**: the upstream rejects every workable shape for `tag_ids` filters (integer
+  value 500s, string and list values 400, and the `in` operator cannot combine with
+  `tag_ids`; all verified). Use `group_by="tag"` for the tag dimension instead.
+- Weekly grouping (`group_by="week"`) is bucketed client-side from the daily rows into
+  ISO weeks with unambiguous `YYYY-Www` labels: the native `week` grouping exists but
+  reports bare week numbers without a year, which breaks across year boundaries.
+- Grouped rows are paginated explicitly (the `pagination` body field is verified to cap
+  rows, so pages are followed until a short one); a safety page limit guards the loop.
+  The exact `count` aggregation is not accepted upstream — per-row counts arrive free.
+- `possibly_truncated` is always false here: aggregation is server-side and row pages
+  are followed explicitly.
 
 ### Planned entries semantics
 

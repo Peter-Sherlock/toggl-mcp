@@ -18,6 +18,7 @@ from mcp_types import CallToolResult
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 READ_TOOL_NAMES = [
     "list_projects",
+    "get_project",
     "get_current_timer",
     "get_time_entries",
     "get_time_entry",
@@ -43,6 +44,9 @@ WRITE_TOOL_NAMES = [
     "delete_time_entry",
     "create_project",
     "update_project",
+    "set_project_archived",
+    "set_project_completed",
+    "duplicate_project",
     "delete_project",
     "create_client",
     "update_client",

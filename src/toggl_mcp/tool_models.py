@@ -29,17 +29,54 @@ class ProjectSummary(ToolOutput):
 
     id: int = Field(description="Toggl project ID accepted by start_timer.")
     name: str = Field(description="Human-readable project name.")
-    active: bool = Field(description="Whether the project is active.")
+    archived: bool = Field(
+        description=(
+            "Whether the project is archived. Archived projects typically should not "
+            "receive new tracked time."
+        )
+    )
     description: str | None = Field(default=None, description="Optional project description.")
+    client_id: int | None = Field(
+        default=None, description="Assigned client ID, if any (see list_clients)."
+    )
 
     @classmethod
     def from_project(cls, project: Project) -> ProjectSummary:
         return cls(
             id=project.id,
             name=project.name,
-            active=project.active,
+            archived=project.archived,
             description=project.description,
+            client_id=project.client_id,
         )
+
+
+class ProjectDetailOutput(ToolOutput):
+    """Full detail of one project, including its aggregate counters."""
+
+    id: int = Field(description="Toggl project ID accepted by start_timer.")
+    name: str = Field(description="Human-readable project name.")
+    workspace_id: int = Field(description="Workspace the project belongs to.")
+    archived: bool = Field(description="Whether the project is archived.")
+    completed: bool = Field(description="Whether the project is marked complete.")
+    pinned: bool = Field(description="Whether the project is pinned in the UI.")
+    private: bool = Field(description="Whether the project is restricted to members.")
+    billable: bool = Field(description="Whether time on the project is billable.")
+    description: str | None = Field(description="Optional project description.")
+    color: str | None = Field(description="Project color, if set.")
+    client_id: int | None = Field(description="Assigned client ID, if any.")
+    estimated_mins: int | None = Field(description="Estimated minutes, if set.")
+    start_date: datetime | None = Field(description="Project start date, if set.")
+    end_date: datetime | None = Field(description="Project end date, if set.")
+    completed_at: datetime | None = Field(
+        description="When the project was marked complete, if it is."
+    )
+    total_tracked_seconds: int | None = Field(
+        description="Seconds tracked on the project, as reported by the detail endpoint."
+    )
+    total_tasks: int | None = Field(
+        description="Number of tasks on the project, as reported by the detail endpoint."
+    )
 
 
 class TimeEntrySummary(ToolOutput):

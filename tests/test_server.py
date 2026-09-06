@@ -62,6 +62,7 @@ async def test_tools_list_hides_write_tools_by_default() -> None:
 
 READ_TOOL_NAMES = [
     "list_projects",
+    "get_project",
     "get_current_timer",
     "get_time_entries",
     "get_time_entry",
@@ -87,6 +88,9 @@ WRITE_TOOL_NAMES = [
     "delete_time_entry",
     "create_project",
     "update_project",
+    "set_project_archived",
+    "set_project_completed",
+    "duplicate_project",
     "delete_project",
     "create_client",
     "update_client",
@@ -143,7 +147,7 @@ async def test_read_tools_return_structured_agent_facing_results() -> None:
                             "id": 88,
                             "name": "Agent Learning",
                             "workspace_id": WORKSPACE_ID,
-                            "active": True,
+                            "archived_at": None,
                         }
                     ],
                     "total": 1,
@@ -178,8 +182,9 @@ async def test_read_tools_return_structured_agent_facing_results() -> None:
             {
                 "id": 88,
                 "name": "Agent Learning",
-                "active": True,
+                "archived": False,
                 "description": None,
+                "client_id": None,
             }
         ],
     }
@@ -658,6 +663,113 @@ async def test_update_client_and_delete_tag_round_trip() -> None:
     assert deleted.structured_content == {"deleted": True, "entity_id": 7}
     put_body = json.loads(requests[0].content)
     assert put_body == {"name": "Renamed"}
+
+
+@pytest.mark.asyncio
+async def test_get_project_returns_structured_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/projects/88")
+        return httpx.Response(
+            200,
+            json={
+                "id": 88,
+                "name": "Agent Learning",
+                "workspace_id": WORKSPACE_ID,
+                "client_id": 5,
+                "color": "#AA33CC",
+                "billable": True,
+                "estimated_mins": 120,
+                "archived_at": None,
+                "completed_at": "2026-08-01T10:00:00Z",
+                "total_tracked_secs": 7200,
+                "total_tasks": 3,
+            },
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=False,
+    )
+
+    async with Client(server) as client:
+        result = await client.call_tool("get_project", {"project_id": 88})
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["archived"] is False
+    assert result.structured_content["completed"] is True
+    assert result.structured_content["total_tracked_seconds"] == 7200
+    assert result.structured_content["estimated_mins"] == 120
+
+
+@pytest.mark.asyncio
+async def test_project_lifecycle_tools_round_trip() -> None:
+    requests: list[httpx.Request] = []
+    state: dict[str, str | None] = {"archived_at": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST" and request.url.path.endswith("/duplicate"):
+            return httpx.Response(
+                200,
+                json={"id": 89, "name": "Copy", "workspace_id": WORKSPACE_ID},
+            )
+        if request.method == "PATCH":
+            if request.url.path.endswith("/archive"):
+                state["archived_at"] = "2026-09-06T02:21:36Z"
+            else:
+                assert request.url.path.endswith("/unarchive")
+                state["archived_at"] = None
+            return httpx.Response(204)
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            json={
+                "id": 88,
+                "name": "Agent Learning",
+                "workspace_id": WORKSPACE_ID,
+                "archived_at": state["archived_at"],
+            },
+        )
+
+    server = create_server(
+        config_loader=config,
+        transport=httpx.MockTransport(handler),
+        enable_write_tools=True,
+    )
+
+    async with Client(server) as client:
+        archived = await client.call_tool(
+            "set_project_archived", {"project_id": 88, "archived": True}
+        )
+        reopened = await client.call_tool(
+            "set_project_archived", {"project_id": 88, "archived": False}
+        )
+        duplicate = await client.call_tool(
+            "duplicate_project", {"project_id": 88, "name": "Copy"}
+        )
+
+    assert archived.is_error is False
+    assert archived.structured_content is not None
+    assert archived.structured_content["project"]["archived"] is True
+    assert reopened.structured_content is not None
+    assert reopened.structured_content["project"]["archived"] is False
+    assert duplicate.structured_content == {
+        "created": True,
+        "project": {
+            "id": 89,
+            "name": "Copy",
+            "archived": False,
+            "description": None,
+            "client_id": None,
+        },
+    }
+    patch_paths = [r.url.path for r in requests if r.method == "PATCH"]
+    assert patch_paths == [
+        f"{SCOPE}/projects/88/archive",
+        f"{SCOPE}/projects/88/unarchive",
+    ]
 
 
 @pytest.mark.asyncio

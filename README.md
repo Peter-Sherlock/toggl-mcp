@@ -10,6 +10,8 @@ API client.
 Read tools are exposed by default:
 
 - `list_projects()`
+- `get_project(project_id)` — full detail: estimate, dates, archived/completed state,
+  tracked-time totals.
 - `get_current_timer()`
 - `get_time_entries(start_date, end_date)`
 - `get_time_entry(entry_id)`
@@ -110,6 +112,26 @@ aggregation happens server-side; the client resolves labels and exact entry tota
   `update_tag` reads the current state first so omitted fields keep their values.
 - `DELETE` on both routes answers an empty 204.
 
+### Project lifecycle semantics
+
+All verified live:
+
+- The create payload key is `private` (`is_private` is silently ignored), and the
+  create/update payloads have no `active` field at all. The legacy `active` flag is
+  read-only, ignored by every mutation, and reported false even for projects in normal
+  use — so the agent-facing models expose `archived` (derived from `archived_at`)
+  instead.
+- Updates must go through the partial `PATCH` route: the PUT route is a full replace
+  that silently resets omitted fields to their defaults (verified — a PUT without
+  `private` reset it to false) and requires `name`.
+- `PATCH .../archive` and `.../unarchive` answer an empty 204; the archive state is the
+  `archived_at` timestamp, confirmed by re-reading.
+- `POST .../complete` answers a `{project}` envelope while `POST .../uncomplete`
+  answers the bare project; the completion state is `completed_at`, also confirmed by
+  re-reading.
+- `POST .../duplicate` answers 201 with the new project (fresh color, upstream-chosen
+  name unless an explicit one is sent).
+
 Write tools are exposed only when `TOGGL_ENABLE_WRITE_TOOLS=true`:
 
 - `start_timer(description, project_id=None)`
@@ -122,8 +144,13 @@ Write tools are exposed only when `TOGGL_ENABLE_WRITE_TOOLS=true`:
 - `restore_time_entry(entry_id)`
 - `log_planned_entry(entry_id)`
 - `delete_time_entry(entry_id)`
-- `create_project(name, active=True, client_id=None, color=None, is_private=True)`
-- `update_project(project_id, name=None, active=None, client_id=None)`
+- `create_project(name, client_id=None, color=None, description=None, private=True,
+  billable=False, estimated_mins=None)`
+- `update_project(project_id, name=None, client_id=None, color=None, description=None,
+  private=None, billable=None, estimated_mins=None)`
+- `set_project_archived(project_id, archived)`
+- `set_project_completed(project_id, completed)`
+- `duplicate_project(project_id, name=None)`
 - `delete_project(project_id)`
 - `create_client(name)`
 - `update_client(client_id, name)`
@@ -209,9 +236,9 @@ The canonical `api.track.toggl.com/api/v9` host rejects `toggl_sk_` credentials 
 Bearer / 403 Basic); those keys are Focus API tokens and only work against
 `focus.toggl.com/api`.
 
-Project mutations are covered by offline protocol tests but have not been exercised
-against the live account. Client and tag mutations (create, update, delete) plus the
-whole time-entry lifecycle, including restore, are verified against the live account.
+Project mutations (create, update, archive, complete, duplicate, delete) plus client
+and tag mutations (create, update, delete) plus the whole time-entry lifecycle,
+including restore, are verified against the live account.
 
 Write operations against the live account are intentionally not exercised by automated
 verification; they change real Toggl data.
@@ -265,7 +292,7 @@ The repository's parent workspace contains a project-scoped Codex configuration 
 server over stdio with the locked uv environment and loads secrets from this project's `.env`.
 The API key is not copied into Codex configuration.
 
-The configuration allowlists exactly the thirty-one registered tools. Its `writes` approval
+The configuration allowlists exactly the thirty-five registered tools. Its `writes` approval
 policy allows the read-only tools without a write approval and asks for approval before any
 write tool runs. A drift test (`tests/test_codex_config.py`) fails when `enabled_tools`
 no longer matches the registered tool surface. Run `/mcp` in Codex to inspect the connected

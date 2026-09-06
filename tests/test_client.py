@@ -921,39 +921,195 @@ async def test_delete_time_entry_tolerates_non_json_ok_body() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_and_update_project_use_org_scoped_paths() -> None:
+async def test_create_and_update_project_use_verified_payloads() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 91,
+                    "name": "Renamed project",
+                    "workspace_id": WORKSPACE_ID,
+                    "client_id": 5,
+                    "billable": False,
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 91,
+                    "name": "New project",
+                    "workspace_id": WORKSPACE_ID,
+                    "client_id": 5,
+                },
+            )
+        assert request.method == "PATCH"
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        created = await client.create_project(
+            "New project", client_id=5, billable=True, estimated_mins=90
+        )
+        updated = await client.update_project(91, name="Renamed project", billable=False)
+
+    # Verified: the create key is `private` (is_private is ignored upstream) and the
+    # create payload has no `active` field.
+    assert requests[0].url.path == f"{SCOPE}/projects"
+    assert json.loads(requests[0].content) == {
+        "name": "New project",
+        "private": True,
+        "created_with": "toggl-mcp",
+        "client_id": 5,
+        "billable": True,
+        "estimated_mins": 90,
+    }
+    # Verified: updates go through the partial PATCH route and re-read afterwards.
+    assert requests[1].url.path == f"{SCOPE}/projects/91"
+    assert json.loads(requests[1].content) == {"name": "Renamed project", "billable": False}
+    assert [request.method for request in requests] == ["POST", "PATCH", "GET"]
+    assert created.client_id == 5
+    assert updated.name == "Renamed project"
+    assert updated.archived is False
+
+
+@pytest.mark.asyncio
+async def test_get_project_maps_detail_fields() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == f"{SCOPE}/projects/91"
         return httpx.Response(
             200,
             json={
                 "id": 91,
-                "name": "Renamed project",
+                "name": "Agent Learning",
                 "workspace_id": WORKSPACE_ID,
-                "active": False,
                 "client_id": 5,
+                "color": "#AA33CC",
+                "description": "detail",
+                "pinned": True,
+                "private": True,
+                "billable": True,
+                "estimated_mins": 120,
+                "start_date": "2026-01-15",
+                "end_date": "2026-12-31",
+                "completed_at": "2026-08-01T10:00:00Z",
+                "archived_at": None,
+                "total_tracked_secs": 7200,
+                "total_tasks": 3,
             },
         )
 
     transport = httpx.MockTransport(handler)
     async with TogglClient(config(), transport=transport) as client:
-        created = await client.create_project("New project", client_id=5)
-        updated = await client.update_project(91, name="Renamed project", active=False)
+        project = await client.get_project(91)
 
-    assert requests[0].url.path == f"{SCOPE}/projects"
-    assert json.loads(requests[0].content) == {
-        "name": "New project",
-        "active": True,
-        "is_private": True,
-        "created_with": "toggl-mcp",
-        "client_id": 5,
+    assert project.completed is True
+    assert project.archived is False
+    assert project.total_tracked_seconds == 7200
+    assert project.total_tasks == 3
+    assert project.estimated_mins == 120
+    assert project.pinned is True
+
+
+@pytest.mark.asyncio
+async def test_set_project_archived_uses_verbs_and_confirms_via_reread() -> None:
+    requests: list[httpx.Request] = []
+    state: dict[str, str | None] = {"archived_at": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "PATCH":
+            if request.url.path.endswith("/archive"):
+                state["archived_at"] = "2026-09-06T02:21:36Z"
+            elif request.url.path.endswith("/unarchive"):
+                state["archived_at"] = None
+            return httpx.Response(204)
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            json={
+                "id": 91,
+                "name": "Agent Learning",
+                "workspace_id": WORKSPACE_ID,
+                "archived_at": state["archived_at"],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        archived = await client.set_project_archived(91, archived=True)
+        reopened = await client.set_project_archived(91, archived=False)
+
+    assert archived.archived is True
+    assert reopened.archived is False
+    assert [request.url.path for request in requests if request.method == "PATCH"] == [
+        f"{SCOPE}/projects/91/archive",
+        f"{SCOPE}/projects/91/unarchive",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_project_completed_handles_both_response_shapes() -> None:
+    requests: list[httpx.Request] = []
+    state: dict[str, str | None] = {"completed_at": None}
+    project_json = {
+        "id": 91,
+        "name": "Agent Learning",
+        "workspace_id": WORKSPACE_ID,
     }
-    assert requests[1].url.path == f"{SCOPE}/projects/91"
-    assert json.loads(requests[1].content) == {"name": "Renamed project", "active": False}
-    assert created.client_id == 5
-    assert updated.active is False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            if request.url.path.endswith("/complete"):
+                # Verified: complete answers a {project} envelope...
+                state["completed_at"] = "2026-09-06T02:22:37Z"
+                return httpx.Response(
+                    200, json={"project": {**project_json, "completed_at": state["completed_at"]}}
+                )
+            # ...while uncomplete answers the bare project.
+            assert request.url.path.endswith("/uncomplete")
+            state["completed_at"] = None
+            return httpx.Response(200, json={**project_json})
+        assert request.method == "GET"
+        return httpx.Response(200, json={**project_json, "completed_at": state["completed_at"]})
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        completed = await client.set_project_completed(91, completed=True)
+        reopened = await client.set_project_completed(91, completed=False)
+
+    assert completed.completed is True
+    assert reopened.completed is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_project_posts_name_only_when_given() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == f"{SCOPE}/projects/91/duplicate"
+        return httpx.Response(
+            201,
+            json={"id": 92, "name": "Copy", "workspace_id": WORKSPACE_ID},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with TogglClient(config(), transport=transport) as client:
+        duplicate = await client.duplicate_project(91)
+        named = await client.duplicate_project(91, name="  Copy  ")
+
+    assert json.loads(requests[0].content) == {}
+    assert json.loads(requests[1].content) == {"name": "Copy"}
+    assert duplicate.id == 92
+    assert named.name == "Copy"
 
 
 @pytest.mark.asyncio

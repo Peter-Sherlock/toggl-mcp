@@ -53,6 +53,7 @@ from toggl_mcp.tool_models import (
     MemberSummary,
     MeSettingsOutput,
     PlannedEntrySummary,
+    ProjectDetailOutput,
     ProjectSummary,
     RestoreTimeEntryOutput,
     SearchOutput,
@@ -188,6 +189,42 @@ def create_server(
         projects = await _execute("list_projects", _state(context).client.list_projects)
         summaries = [ProjectSummary.from_project(project) for project in projects]
         return ListProjectsOutput(count=len(summaries), projects=summaries)
+
+    @server.tool(
+        annotations=read_annotations,
+        structured_output=True,
+        description=(
+            "Read one project by its exact Toggl ID, including its estimate, dates, "
+            "archived/completed state, and tracked-time totals."
+        ),
+    )
+    async def get_project(
+        project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
+        context: Context[ServerState, Any],
+    ) -> ProjectDetailOutput:
+        project = await _execute(
+            "get_project",
+            lambda: _state(context).client.get_project(project_id),
+        )
+        return ProjectDetailOutput(
+            id=project.id,
+            name=project.name,
+            workspace_id=project.workspace_id,
+            archived=project.archived,
+            completed=project.completed,
+            pinned=project.pinned,
+            private=project.private,
+            billable=project.billable,
+            description=project.description,
+            color=project.color,
+            client_id=project.client_id,
+            estimated_mins=project.estimated_mins,
+            start_date=project.start_date,
+            end_date=project.end_date,
+            completed_at=project.completed_at,
+            total_tracked_seconds=project.total_tracked_seconds,
+            total_tasks=project.total_tasks,
+        )
 
     @server.tool(
         annotations=read_annotations,
@@ -844,10 +881,20 @@ def create_server(
         )
         async def create_project(
             name: Annotated[str, Field(min_length=1, description="New project name.")],
-            active: Annotated[bool, Field(description="Whether the project is active.")] = True,
             client_id: Annotated[int | None, Field(gt=0)] = None,
             color: Annotated[str | None, Field(description="Hex color for the project.")] = None,
-            is_private: Annotated[bool, Field(description="Restrict the project.")] = True,
+            description: Annotated[
+                str | None, Field(description="Optional project description.")
+            ] = None,
+            private: Annotated[
+                bool, Field(description="Restrict the project to workspace members.")
+            ] = True,
+            billable: Annotated[
+                bool, Field(description="Mark time on the project as billable.")
+            ] = False,
+            estimated_mins: Annotated[
+                int | None, Field(gt=0, description="Project estimate in minutes.")
+            ] = None,
             *,
             context: Context[ServerState, Any],
         ) -> CreateProjectOutput:
@@ -855,10 +902,12 @@ def create_server(
                 "create_project",
                 lambda: _state(context).client.create_project(
                     name,
-                    active=active,
                     client_id=client_id,
                     color=color,
-                    is_private=is_private,
+                    description=description,
+                    private=private,
+                    billable=billable,
+                    estimated_mins=estimated_mins,
                 ),
             )
             return CreateProjectOutput(project=ProjectSummary.from_project(project))
@@ -867,25 +916,109 @@ def create_server(
             annotations=update_annotations,
             structured_output=True,
             description=(
-                "Update a project by ID. Omitted fields stay unchanged. This changes real "
-                "Toggl data."
+                "Update a project by ID: rename, recolor, reassign the client, change "
+                "its description/privacy/billable flag/estimate. Omitted fields stay "
+                "unchanged. To archive or complete a project, use set_project_archived "
+                "or set_project_completed. This changes real Toggl data."
             ),
         )
         async def update_project(
             project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
             name: Annotated[str | None, Field(min_length=1)] = None,
-            active: Annotated[bool | None, Field()] = None,
             client_id: Annotated[int | None, Field(gt=0)] = None,
+            color: Annotated[str | None, Field()] = None,
+            description: Annotated[str | None, Field()] = None,
+            private: Annotated[bool | None, Field()] = None,
+            billable: Annotated[bool | None, Field()] = None,
+            estimated_mins: Annotated[int | None, Field(gt=0)] = None,
             *,
             context: Context[ServerState, Any],
         ) -> UpdateProjectOutput:
             project = await _execute(
                 "update_project",
                 lambda: _state(context).client.update_project(
-                    project_id, name=name, active=active, client_id=client_id
+                    project_id,
+                    name=name,
+                    client_id=client_id,
+                    color=color,
+                    description=description,
+                    private=private,
+                    billable=billable,
+                    estimated_mins=estimated_mins,
                 ),
             )
             return UpdateProjectOutput(project=ProjectSummary.from_project(project))
+
+        @server.tool(
+            annotations=update_annotations,
+            structured_output=True,
+            description=(
+                "Archive (archived=true) or unarchive (archived=false) a project by ID. "
+                "Archived projects should not receive new tracked time. This changes "
+                "real Toggl data."
+            ),
+        )
+        async def set_project_archived(
+            project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
+            archived: Annotated[
+                bool, Field(description="True to archive, false to unarchive.")
+            ],
+            *,
+            context: Context[ServerState, Any],
+        ) -> UpdateProjectOutput:
+            project = await _execute(
+                "set_project_archived",
+                lambda: _state(context).client.set_project_archived(
+                    project_id, archived=archived
+                ),
+            )
+            return UpdateProjectOutput(project=ProjectSummary.from_project(project))
+
+        @server.tool(
+            annotations=update_annotations,
+            structured_output=True,
+            description=(
+                "Mark a project complete (completed=true) or reopen it (completed=false) "
+                "by ID. This changes real Toggl data."
+            ),
+        )
+        async def set_project_completed(
+            project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
+            completed: Annotated[
+                bool, Field(description="True to mark complete, false to reopen.")
+            ],
+            *,
+            context: Context[ServerState, Any],
+        ) -> UpdateProjectOutput:
+            project = await _execute(
+                "set_project_completed",
+                lambda: _state(context).client.set_project_completed(
+                    project_id, completed=completed
+                ),
+            )
+            return UpdateProjectOutput(project=ProjectSummary.from_project(project))
+
+        @server.tool(
+            annotations=create_annotations,
+            structured_output=True,
+            description=(
+                "Duplicate a project by ID, optionally under an explicit name; upstream "
+                "assigns the copy a fresh color. This changes real Toggl data."
+            ),
+        )
+        async def duplicate_project(
+            project_id: Annotated[int, Field(gt=0, description="Exact Toggl project ID.")],
+            name: Annotated[
+                str | None, Field(min_length=1, description="Name for the copy.")
+            ] = None,
+            *,
+            context: Context[ServerState, Any],
+        ) -> CreateProjectOutput:
+            project = await _execute(
+                "duplicate_project",
+                lambda: _state(context).client.duplicate_project(project_id, name=name),
+            )
+            return CreateProjectOutput(project=ProjectSummary.from_project(project))
 
         @server.tool(
             annotations=delete_annotations,

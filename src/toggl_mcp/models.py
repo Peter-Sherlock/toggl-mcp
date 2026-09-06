@@ -18,19 +18,45 @@ class Tag(BaseModel):
 
 
 class Project(BaseModel):
-    """Project fields useful to an agent; unrelated billing metadata is ignored."""
+    """Project fields useful to an agent; unrelated billing metadata is ignored.
+
+    The upstream `active` flag is deliberately not modeled: it is read-only,
+    ignored by every mutation payload, and reported false even for projects in
+    normal use (verified live). Visibility is governed by `archived_at`.
+    """
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     id: int
     name: str
     workspace_id: int
-    active: bool = True
     color: str | None = None
     description: str | None = None
     client_id: int | None = None
     pinned: bool = False
     private: bool = False
+    billable: bool = False
+    estimated_mins: int | None = None
+    start_date: datetime | None = None
+    end_date: datetime | None = None
+    completed_at: datetime | None = None
+    archived_at: datetime | None = None
+    total_tracked_seconds: int | None = Field(
+        default=None, validation_alias="total_tracked_secs"
+    )
+    total_tasks: int | None = None
+
+    @property
+    def archived(self) -> bool:
+        """Whether the project is archived; the archive state is this timestamp."""
+
+        return self.archived_at is not None
+
+    @property
+    def completed(self) -> bool:
+        """Whether the project is marked complete; the flag is this timestamp."""
+
+        return self.completed_at is not None
 
 
 class Client(BaseModel):

@@ -1081,31 +1081,54 @@ class TogglClient:
         self,
         name: str,
         *,
-        active: bool = True,
         client_id: int | None = None,
         color: str | None = None,
-        is_private: bool = True,
+        description: str | None = None,
+        private: bool = True,
+        billable: bool = False,
+        estimated_mins: int | None = None,
     ) -> Project:
-        """Create a project in the configured workspace."""
+        """Create a project in the configured workspace.
+
+        Verified against the Focus API: the create payload key is `private`
+        (`is_private` is silently ignored), and there is no `active` field — the
+        legacy active flag starts false and does not affect usability. Billable,
+        estimated minutes, description, and color are all accepted (verified).
+        """
 
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("name must not be empty")
         if client_id is not None and client_id <= 0:
             raise ValueError("client_id must be a positive integer")
+        if estimated_mins is not None and estimated_mins <= 0:
+            raise ValueError("estimated_mins must be a positive integer")
 
         body: dict[str, JsonValue] = {
             "name": clean_name,
-            "active": active,
-            "is_private": is_private,
+            "private": private,
             "created_with": "toggl-mcp",
         }
         if client_id is not None:
             body["client_id"] = client_id
         if color is not None:
             body["color"] = color
+        if description is not None:
+            body["description"] = description
+        if billable:
+            body["billable"] = True
+        if estimated_mins is not None:
+            body["estimated_mins"] = estimated_mins
 
         payload = await self._request_json("POST", f"{self._scope}/projects", json=body)
+        return self._validate(Project, self._unwrap_data(payload))
+
+    async def get_project(self, project_id: int) -> Project:
+        """Read one project with its aggregate fields by ID."""
+
+        if project_id <= 0:
+            raise ValueError("project_id must be a positive integer")
+        payload = await self._request_json("GET", f"{self._scope}/projects/{project_id}")
         return self._validate(Project, self._unwrap_data(payload))
 
     async def update_project(
@@ -1113,10 +1136,21 @@ class TogglClient:
         project_id: int,
         *,
         name: str | None = None,
-        active: bool | None = None,
         client_id: int | None = None,
+        color: str | None = None,
+        description: str | None = None,
+        private: bool | None = None,
+        billable: bool | None = None,
+        estimated_mins: int | None = None,
     ) -> Project:
-        """Partially update a project; fields left as None stay unchanged."""
+        """Partially update a project; fields left as None stay unchanged.
+
+        Verified against the Focus API: the PATCH route is partial and preserves
+        omitted fields, while the PUT route is a full replace that resets omitted
+        fields to their defaults (verified live) — so updates go through PATCH and
+        the project is re-read afterwards. The legacy `active` flag is read-only
+        upstream (silently ignored by both verbs); visibility is the archived state.
+        """
 
         if project_id <= 0:
             raise ValueError("project_id must be a positive integer")
@@ -1126,17 +1160,96 @@ class TogglClient:
             if not clean:
                 raise ValueError("name must not be empty when provided")
             body["name"] = clean
-        if active is not None:
-            body["active"] = active
         if client_id is not None:
             if client_id <= 0:
                 raise ValueError("client_id must be a positive integer")
             body["client_id"] = client_id
+        if color is not None:
+            body["color"] = color
+        if description is not None:
+            body["description"] = description
+        if private is not None:
+            body["private"] = private
+        if billable is not None:
+            body["billable"] = billable
+        if estimated_mins is not None:
+            if estimated_mins <= 0:
+                raise ValueError("estimated_mins must be a positive integer")
+            body["estimated_mins"] = estimated_mins
         if not body:
             raise ValueError("update_project requires at least one field to change")
 
+        await self._request_ok("PATCH", f"{self._scope}/projects/{project_id}", json=body)
+        final = await self.get_project(project_id)
+        if client_id is not None and final.client_id != client_id:
+            raise ValueError(
+                "Upstream did not apply the client change; the target client may be "
+                "invalid. Other field changes may have applied."
+            )
+        return final
+
+    async def set_project_archived(self, project_id: int, *, archived: bool) -> Project:
+        """Archive or unarchive a project.
+
+        Verified against the Focus API: `PATCH .../archive` and `.../unarchive` answer
+        an empty 204 and the archive state is the `archived_at` timestamp, which is
+        confirmed by re-reading the project.
+        """
+
+        if project_id <= 0:
+            raise ValueError("project_id must be a positive integer")
+        verb = "archive" if archived else "unarchive"
+        await self._request_ok("PATCH", f"{self._scope}/projects/{project_id}/{verb}")
+        final = await self.get_project(project_id)
+        if final.archived != archived:
+            raise ValueError("Upstream did not apply the archive change.")
+        return final
+
+    async def set_project_completed(
+        self, project_id: int, *, completed: bool
+    ) -> Project:
+        """Mark a project complete or reopen it.
+
+        Verified against the Focus API: `POST .../complete` answers a `{project}`
+        envelope and `POST .../uncomplete` answers the bare project; the completion
+        state is the `completed_at` timestamp, which is confirmed by re-reading.
+        """
+
+        if project_id <= 0:
+            raise ValueError("project_id must be a positive integer")
+        verb = "complete" if completed else "uncomplete"
         payload = await self._request_json(
-            "PUT", f"{self._scope}/projects/{project_id}", json=body
+            "POST", f"{self._scope}/projects/{project_id}/{verb}"
+        )
+        value = self._unwrap_data(payload)
+        if isinstance(value, dict) and isinstance(value.get("project"), dict):
+            value = value["project"]
+        self._validate(Project, value)
+        final = await self.get_project(project_id)
+        if final.completed != completed:
+            raise ValueError("Upstream did not apply the completion change.")
+        return final
+
+    async def duplicate_project(
+        self, project_id: int, *, name: str | None = None
+    ) -> Project:
+        """Duplicate a project, optionally under an explicit name.
+
+        Verified against the Focus API: `POST .../duplicate` answers 201 with the new
+        project, which carries a fresh color and an active state regardless of the
+        source; an explicit `name` is honored, otherwise upstream names the copy.
+        """
+
+        if project_id <= 0:
+            raise ValueError("project_id must be a positive integer")
+        body: dict[str, JsonValue] = {}
+        if name is not None:
+            clean = name.strip()
+            if not clean:
+                raise ValueError("name must not be empty when provided")
+            body["name"] = clean
+        payload = await self._request_json(
+            "POST", f"{self._scope}/projects/{project_id}/duplicate", json=body
         )
         return self._validate(Project, self._unwrap_data(payload))
 
